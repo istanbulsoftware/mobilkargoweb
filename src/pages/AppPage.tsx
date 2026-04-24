@@ -1,8 +1,9 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { io, type Socket } from 'socket.io-client';
 import Swal from 'sweetalert2';
 import { MediaLightbox } from '../components/MediaLightbox';
-import { api } from '../lib/api';
+import { api, apiOrigin } from '../lib/api';
 
 type UserProfile = {
   id: string;
@@ -92,6 +93,49 @@ type CarrierOffer = {
   vehicleId?: { _id?: string; plateMasked?: string; brand?: string; model?: string };
 };
 
+type CarrierJobShipment = {
+  _id?: string;
+  title?: string;
+  status?: string;
+  transportMode?: 'intracity' | 'intercity';
+  pickupCity?: string;
+  pickupDistrict?: string;
+  dropoffCity?: string;
+  dropoffDistrict?: string;
+  scheduledPickupAt?: string;
+  createdAt?: string;
+};
+
+type CarrierJobRow = {
+  jobBucket: 'upcoming' | 'active' | 'past';
+  offerId: string;
+  offerStatus: string;
+  acceptedAt?: string;
+  price?: number;
+  shipment?: CarrierJobShipment;
+  vehicle?: { _id?: string; plateMasked?: string; brand?: string; model?: string };
+};
+
+type CarrierJobsResponse = {
+  summary: {
+    totalAccepted: number;
+    upcoming: number;
+    active: number;
+    past: number;
+  };
+  upcoming: CarrierJobRow[];
+  active: CarrierJobRow[];
+  past: CarrierJobRow[];
+};
+
+type AppConversationMessage = {
+  _id: string;
+  conversationId?: string;
+  senderUserId?: string | { _id?: string; fullName?: string };
+  text?: string;
+  createdAt?: string;
+};
+
 type CarrierVehicle = {
   _id: string;
   status: string;
@@ -151,10 +195,30 @@ const MODE_LABEL: Record<'intracity' | 'intercity', string> = {
 
 const OFFER_TABS = [
   { key: 'pool', label: 'Yük Havuzu' },
+  { key: 'active_jobs', label: 'Aktif Taşımalar' },
   { key: 'offered', label: 'Teklif Verdiklerim' },
   { key: 'offers', label: 'Tekliflerim' },
   { key: 'alerts', label: 'Yük Gelince Bildir' },
 ] as const;
+
+const EMPTY_CARRIER_JOBS: CarrierJobsResponse = {
+  summary: { totalAccepted: 0, upcoming: 0, active: 0, past: 0 },
+  upcoming: [],
+  active: [],
+  past: [],
+};
+
+const normalizeCarrierJobs = (raw?: Partial<CarrierJobsResponse> | null): CarrierJobsResponse => ({
+  summary: {
+    totalAccepted: Number(raw?.summary?.totalAccepted || 0),
+    upcoming: Number(raw?.summary?.upcoming || 0),
+    active: Number(raw?.summary?.active || 0),
+    past: Number(raw?.summary?.past || 0),
+  },
+  upcoming: Array.isArray(raw?.upcoming) ? raw.upcoming : [],
+  active: Array.isArray(raw?.active) ? raw.active : [],
+  past: Array.isArray(raw?.past) ? raw.past : [],
+});
 
 const SEGMENTS: Array<{
   key: 'personal' | 'company' | 'industrial';
@@ -269,6 +333,8 @@ export function AppPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const token = localStorage.getItem('an_user_token');
+  const queryTab = (searchParams.get('tab') || '').trim();
+  const queryConversationId = (searchParams.get('conversationId') || '').trim();
 
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
@@ -350,6 +416,7 @@ export function AppPage() {
   const [carrierTab, setCarrierTab] = useState<(typeof OFFER_TABS)[number]['key']>('pool');
   const [carrierFeed, setCarrierFeed] = useState<CarrierFeedShipment[]>([]);
   const [carrierOffers, setCarrierOffers] = useState<CarrierOffer[]>([]);
+  const [carrierJobs, setCarrierJobs] = useState<CarrierJobsResponse>(EMPTY_CARRIER_JOBS);
   const [carrierVehicles, setCarrierVehicles] = useState<CarrierVehicle[]>([]);
   const [carrierAlerts, setCarrierAlerts] = useState<CarrierLoadAlert[]>([]);
   const [carrierLoadTypes, setCarrierLoadTypes] = useState<LookupLoadType[]>([]);
@@ -369,6 +436,13 @@ export function AppPage() {
   const [carrierNearbyLabel, setCarrierNearbyLabel] = useState('');
   const [carrierNearbyCenter, setCarrierNearbyCenter] = useState<{ lat: number; lng: number } | null>(null);
   const [carrierRadiusKm, setCarrierRadiusKm] = useState(25);
+  const [chatConversationId, setChatConversationId] = useState('');
+  const [chatMessages, setChatMessages] = useState<AppConversationMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatConnecting, setChatConnecting] = useState(false);
+  const chatSocketRef = useRef<Socket | null>(null);
 
   const segmentConfig = useMemo(() => SEGMENTS.find((x) => x.key === segment) || SEGMENTS[0], [segment]);
 
@@ -423,6 +497,14 @@ export function AppPage() {
 
   const carrierPool = useMemo(() => carrierFeed.filter((x) => !x.hasMyOffer), [carrierFeed]);
   const carrierOffered = useMemo(() => carrierFeed.filter((x) => x.hasMyOffer), [carrierFeed]);
+  const carrierActiveJobs = useMemo(() => {
+    const all = [...carrierJobs.active, ...carrierJobs.upcoming];
+    return all.sort((a, b) => {
+      const aTs = new Date(a.shipment?.scheduledPickupAt || a.acceptedAt || 0).getTime();
+      const bTs = new Date(b.shipment?.scheduledPickupAt || b.acceptedAt || 0).getTime();
+      return bTs - aTs;
+    });
+  }, [carrierJobs.active, carrierJobs.upcoming]);
   const carrierDistanceMap = useMemo(() => {
     const result: Record<string, number> = {};
     if (!carrierNearbyCenter) return result;
@@ -838,15 +920,17 @@ export function AppPage() {
         setCities(Array.isArray(cityRows) ? cityRows : []);
 
         if (me.role === 'carrier') {
-          const [feedRes, offersRes, vehiclesRes, alertsRes, loadTypeRes] = await Promise.all([
+          const [feedRes, offersRes, jobsRes, vehiclesRes, alertsRes, loadTypeRes] = await Promise.all([
             api.get<CarrierFeedShipment[]>('/shipments/feed'),
             api.get<CarrierOffer[]>('/offers/my/detailed'),
+            api.get<CarrierJobsResponse>('/offers/carrier/jobs'),
             api.get<CarrierVehicle[]>('/vehicles/my'),
             api.get<CarrierLoadAlert[]>('/carrier-load-alerts/my'),
             api.get<LookupLoadType[]>('/lookups/load-types'),
           ]);
           setCarrierFeed(Array.isArray(feedRes.data) ? feedRes.data : []);
           setCarrierOffers(Array.isArray(offersRes.data) ? offersRes.data : []);
+          setCarrierJobs(normalizeCarrierJobs(jobsRes.data));
           setCarrierVehicles(Array.isArray(vehiclesRes.data) ? vehiclesRes.data : []);
           setCarrierAlerts(Array.isArray(alertsRes.data) ? alertsRes.data : []);
           setCarrierLoadTypes(Array.isArray(loadTypeRes.data) ? loadTypeRes.data : []);
@@ -861,6 +945,104 @@ export function AppPage() {
     };
     void boot();
   }, [token]);
+
+  useEffect(() => {
+    if (!token || profile?.role !== 'carrier' || carrierTab !== 'active_jobs') return;
+    void refreshCarrierJobs(true);
+  }, [token, profile?.role, carrierTab]);
+
+  useEffect(() => {
+    if (profile?.role !== 'carrier') return;
+    const validTabs = new Set(OFFER_TABS.map((tab) => tab.key));
+    if (queryTab && validTabs.has(queryTab as (typeof OFFER_TABS)[number]['key'])) {
+      setCarrierTab(queryTab as (typeof OFFER_TABS)[number]['key']);
+    }
+    if (queryConversationId) {
+      setChatConversationId(queryConversationId);
+      setCarrierTab('active_jobs');
+    }
+  }, [profile?.role, queryTab, queryConversationId]);
+
+  const loadConversationMessages = async (conversationId: string) => {
+    if (!conversationId) return;
+    setChatLoading(true);
+    try {
+      const { data } = await api.get<{ messages?: AppConversationMessage[] }>(`/conversations/${conversationId}`);
+      setChatMessages(Array.isArray(data?.messages) ? data.messages : []);
+      await api.patch(`/conversations/${conversationId}/read`);
+    } catch (error: any) {
+      setMessage(error?.response?.data?.message || 'Konuşma mesajları yüklenemedi.');
+      setChatMessages([]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const sendConversationMessage = async () => {
+    const text = chatInput.trim();
+    if (!chatConversationId || !text) return;
+    setChatSending(true);
+    try {
+      const { data } = await api.post<AppConversationMessage>(`/conversations/${chatConversationId}/messages`, {
+        messageType: 'text',
+        text,
+      });
+      setChatMessages((prev) => {
+        const exists = prev.some((item) => item._id === data?._id);
+        if (exists) return prev;
+        return [...prev, data];
+      });
+      setChatInput('');
+    } catch (error: any) {
+      setMessage(error?.response?.data?.message || 'Mesaj gönderilemedi.');
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!token || profile?.role !== 'carrier' || !chatConversationId) return;
+    void loadConversationMessages(chatConversationId);
+  }, [token, profile?.role, chatConversationId]);
+
+  useEffect(() => {
+    if (!token || profile?.role !== 'carrier' || !chatConversationId) return;
+
+    setChatConnecting(true);
+    const socket = io(apiOrigin, {
+      transports: ['websocket'],
+      auth: { token },
+    });
+    chatSocketRef.current = socket;
+
+    socket.on('connect', () => {
+      setChatConnecting(false);
+      socket.emit('join:conversation', chatConversationId);
+    });
+    socket.on('disconnect', () => {
+      setChatConnecting(true);
+    });
+    socket.on('conversation:message', (payload: AppConversationMessage) => {
+      if (String(payload?.conversationId || '') !== chatConversationId) return;
+      setChatMessages((prev) => {
+        const exists = prev.some((item) => item._id === payload?._id);
+        if (exists) return prev;
+        return [...prev, payload];
+      });
+      void api.patch(`/conversations/${chatConversationId}/read`).catch(() => undefined);
+    });
+
+    return () => {
+      try {
+        socket.emit('leave:conversation', chatConversationId);
+      } catch {
+        // no-op
+      }
+      socket.disconnect();
+      chatSocketRef.current = null;
+      setChatConnecting(false);
+    };
+  }, [token, profile?.role, chatConversationId]);
 
   useEffect(() => {
     if (!token || profile?.role !== 'shipper') return;
@@ -1321,6 +1503,20 @@ export function AppPage() {
     setCarrierRadiusKm(25);
   };
 
+  const refreshCarrierJobs = async (silent = false) => {
+    try {
+      const { data } = await api.get<CarrierJobsResponse>('/offers/carrier/jobs');
+      setCarrierJobs(normalizeCarrierJobs(data));
+    } catch (error: any) {
+      setCarrierJobs(EMPTY_CARRIER_JOBS);
+      if (!silent) {
+        const errText = error?.response?.data?.message || 'Aktif taşımalar yüklenemedi.';
+        setMessage(errText);
+        notifyError(errText);
+      }
+    }
+  };
+
   const applyNearbyCarrierFilter = () => {
     if (!navigator.geolocation) {
       setMessage('Tarayıcı konum desteği bulunamadı.');
@@ -1331,13 +1527,16 @@ export function AppPage() {
     setMessage('');
     navigator.geolocation.getCurrentPosition(
       (pos) => {
+        // Net davranış: Yakınımdakiler filtresi sadece radius + pickupGeo bazlı çalışır.
+        // İl/ilçe filtreleri otomatik set edilmez, varsa temizlenir.
+        setCarrierFilterCityId('');
+        setCarrierFilterDistrict('');
         setCarrierNearbyCenter({ lat: pos.coords.latitude, lng: pos.coords.longitude });
         const googleObj = (window as any).google;
         const geocoder = googleObj?.maps ? new googleObj.maps.Geocoder() : null;
         if (!geocoder) {
           setCarrierNearbyLoading(false);
-          setMessage('Yakınımdakiler filtresi için Google Maps servisi hazır değil.');
-          notifyWarning('Yakınımdakiler filtresi için Google Maps servisi hazır değil.');
+          setCarrierNearbyLabel(`Mevcut konum (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`);
           return;
         }
         geocoder.geocode(
@@ -1346,8 +1545,7 @@ export function AppPage() {
             setCarrierNearbyLoading(false);
             const ok = status === googleObj.maps.GeocoderStatus.OK && Array.isArray(results) && results.length > 0;
             if (!ok) {
-              setMessage('Mevcut konumdan il/ilçe çözümlenemedi.');
-              notifyWarning('Mevcut konumdan il/ilçe çözümlenemedi.');
+              setCarrierNearbyLabel(`Mevcut konum (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`);
               return;
             }
             const components: any[] = results[0]?.address_components || [];
@@ -1357,17 +1555,9 @@ export function AppPage() {
               components.find((c) => c.types?.includes('locality'));
             const cityLong = cityComponent?.long_name || cityComponent?.short_name || '';
             const districtLong = districtComponent?.long_name || districtComponent?.short_name || '';
-            const cityId = findCityIdByName(cityLong);
-            if (!cityId) {
-              setMessage('Konum il bilgisi sistemdeki şehir listesi ile eşleşmedi.');
-              notifyWarning('Konum il bilgisi sistemdeki şehir listesi ile eşleşmedi.');
-              return;
-            }
-            const districts = await loadDistricts(cityId);
-            const districtName = resolveDistrictName(districts, districtLong);
-            setCarrierFilterCityId(cityId);
-            setCarrierFilterDistrict(districtName || '');
-            setCarrierNearbyLabel(`${cityLong}${districtName ? ` / ${districtName}` : ''}`);
+            setCarrierNearbyLabel(
+              `${cityLong || 'Mevcut konum'}${districtLong ? ` / ${districtLong}` : ''}`,
+            );
           },
         );
       },
@@ -1414,6 +1604,64 @@ export function AppPage() {
       <section className="container py-5">
         <h1 className="shipment-page-title mb-4">Taşıyıcı Yük Alanı</h1>
         {message ? <div className="alert alert-warning">{message}</div> : null}
+
+        {chatConversationId ? (
+          <div className="panel-card p-4 mb-3">
+            <div className="d-flex justify-content-between align-items-center gap-2 mb-3">
+              <h4 className="fw-bold mb-0">Mesajlaşma</h4>
+              <span className={`shipment-status-pill ${chatConnecting ? 'tone-warning' : 'tone-success'}`}>
+                {chatConnecting ? 'Bağlanıyor...' : 'Bağlandı'}
+              </span>
+            </div>
+            <div className="border rounded-3 p-3 mb-3" style={{ maxHeight: 300, overflowY: 'auto', background: '#faf9fe' }}>
+              {chatLoading ? (
+                <div className="text-secondary small">Mesajlar yükleniyor...</div>
+              ) : chatMessages.length === 0 ? (
+                <div className="text-secondary small">Henüz mesaj yok.</div>
+              ) : (
+                chatMessages.map((item) => {
+                  const senderId =
+                    typeof item.senderUserId === 'string'
+                      ? item.senderUserId
+                      : String(item.senderUserId?._id || '');
+                  const mine = Boolean(profile?.id && senderId && profile.id === senderId);
+                  return (
+                    <div key={item._id} className={`d-flex mb-2 ${mine ? 'justify-content-end' : 'justify-content-start'}`}>
+                      <div
+                        className={`px-3 py-2 rounded-3 ${mine ? 'text-white' : ''}`}
+                        style={{ maxWidth: '80%', background: mine ? '#3E2C78' : '#ffffff', border: mine ? 'none' : '1px solid #ece7ff' }}
+                      >
+                        <div className="small">{item.text || '-'}</div>
+                        <div className={`small mt-1 ${mine ? 'text-white-50' : 'text-secondary'}`}>
+                          {item.createdAt
+                            ? new Date(item.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
+                            : ''}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+            <div className="d-flex gap-2">
+              <input
+                className="form-control shipment-input"
+                placeholder="Mesaj yaz..."
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    void sendConversationMessage();
+                  }
+                }}
+              />
+              <button type="button" className="btn btn-primary" disabled={chatSending || !chatInput.trim()} onClick={() => void sendConversationMessage()}>
+                {chatSending ? 'Gönderiliyor...' : 'Gönder'}
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         <div className="d-flex flex-wrap gap-2 mb-3">
           {OFFER_TABS.map((tab) => (
@@ -1579,6 +1827,69 @@ export function AppPage() {
                     </div>
                   );
                 })}
+              </div>
+            )}
+          </div>
+        ) : null}
+
+        {carrierTab === 'active_jobs' ? (
+          <div className="panel-card p-4">
+            <div className="d-flex justify-content-between align-items-center mb-3">
+              <h4 className="fw-bold mb-0">Aktif Taşımalar ({carrierActiveJobs.length})</h4>
+              <button type="button" className="btn btn-sm btn-outline-primary" onClick={() => void refreshCarrierJobs()}>
+                Yenile
+              </button>
+            </div>
+            <div className="row g-3 mb-3">
+              <div className="col-md-3"><div className="panel-card p-3 account-stat-card"><small>Toplam Kabul</small><h4>{carrierJobs.summary.totalAccepted}</h4></div></div>
+              <div className="col-md-3"><div className="panel-card p-3 account-stat-card"><small>Aktif</small><h4>{carrierJobs.summary.active}</h4></div></div>
+              <div className="col-md-3"><div className="panel-card p-3 account-stat-card"><small>Planlı</small><h4>{carrierJobs.summary.upcoming}</h4></div></div>
+              <div className="col-md-3"><div className="panel-card p-3 account-stat-card"><small>Geçmiş</small><h4>{carrierJobs.summary.past}</h4></div></div>
+            </div>
+            {carrierActiveJobs.length === 0 ? (
+              <div className="text-secondary">Aktif kabul edilmiş taşıma bulunmuyor.</div>
+            ) : (
+              <div className="table-responsive">
+                <table className="table align-middle">
+                  <thead>
+                    <tr>
+                      <th>Yük</th>
+                      <th>Rota</th>
+                      <th>Araç</th>
+                      <th>Tutar</th>
+                      <th>Kabul Tarihi</th>
+                      <th>Durum</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {carrierActiveJobs.map((job) => (
+                      <tr key={job.offerId}>
+                        <td>
+                          {job.shipment?._id ? (
+                            <Link to={`/hesabim/yuk/${job.shipment._id}`} className="text-decoration-none fw-semibold">
+                              {job.shipment?.title || '-'}
+                            </Link>
+                          ) : (
+                            job.shipment?.title || '-'
+                          )}
+                        </td>
+                        <td>
+                          {job.shipment?.pickupCity || '-'} / {job.shipment?.pickupDistrict || '-'} {'>'} {job.shipment?.dropoffCity || '-'} / {job.shipment?.dropoffDistrict || '-'}
+                        </td>
+                        <td>
+                          {(job.vehicle?.plateMasked || '-')} {job.vehicle?.brand || ''} {job.vehicle?.model || ''}
+                        </td>
+                        <td>{typeof job.price === 'number' ? `?${job.price}` : '-'}</td>
+                        <td>{formatDate(job.acceptedAt)}</td>
+                        <td>
+                          <span className={`shipment-status-pill ${job.jobBucket === 'active' ? 'tone-success' : 'tone-info'}`}>
+                            {job.jobBucket === 'active' ? 'Aktif' : 'Planlı'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
@@ -2614,6 +2925,8 @@ function parseDescriptionLine(raw: string | undefined, key: string): string {
   const idx = found.indexOf(':');
   return idx >= 0 ? found.slice(idx + 1).trim() : '';
 }
+
+
 
 
 

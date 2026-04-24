@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import { api } from '../lib/api';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { io, type Socket } from 'socket.io-client';
+import { api, apiOrigin } from '../lib/api';
 import Swal from 'sweetalert2';
 
 type OfferLite = {
@@ -31,11 +32,20 @@ type ShipmentDetail = {
   routeDurationMin?: number;
   routeSummary?: string;
   scheduledPickupAt?: string;
+  deliveryDeadlineAt?: string;
   isUrgent?: boolean;
+  needsPackaging?: boolean;
+  needsAssembly?: boolean;
+  needsHelper?: boolean;
+  needsElevator?: boolean;
+  estimatedWeightKg?: number;
+  estimatedVolumeM3?: number;
+  pieceCount?: number;
   createdAt: string;
   canViewOffers?: boolean;
   offers?: OfferLite[];
   myOffer?: OfferLite | null;
+  listingOwner?: { id?: string; fullName?: string; phone?: string } | null;
   recommendedVehicleTypes?: Array<{ _id?: string; name?: string; slug?: string }>;
   offerStats?: {
     total: number;
@@ -51,10 +61,23 @@ type ShipmentsDetailedResponse = {
 };
 
 type ViewerProfile = {
+  id?: string;
+  fullName?: string;
   role?: 'shipper' | 'carrier' | 'admin';
 };
 
+type ConversationMessage = {
+  _id: string;
+  conversationId?: string;
+  senderUserId?: string | { _id?: string; fullName?: string };
+  messageType?: 'text' | 'image' | 'system' | 'offer_event' | string;
+  text?: string;
+  attachments?: string[];
+  createdAt?: string;
+};
+
 export function ShipmentDetailPage() {
+  const navigate = useNavigate();
   const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '').trim();
   const { shipmentId } = useParams();
   const [loading, setLoading] = useState(true);
@@ -62,6 +85,7 @@ export function ShipmentDetailPage() {
   const [actionLoadingId, setActionLoadingId] = useState('');
   const [shipment, setShipment] = useState<ShipmentDetail | null>(null);
   const [viewerRole, setViewerRole] = useState<ViewerProfile['role']>();
+  const [viewerUserId, setViewerUserId] = useState('');
   const [activeTab, setActiveTab] = useState<'detail' | 'map' | 'offers'>('detail');
   const [carrierVehicles, setCarrierVehicles] = useState<Array<{ _id: string; plateMasked?: string; brand?: string; model?: string; status?: string; vehicleTypeId?: string | { _id?: string } }>>([]);
   const [carrierOfferDraft, setCarrierOfferDraft] = useState<{ vehicleId: string; amount: string; note: string }>({
@@ -73,11 +97,19 @@ export function ShipmentDetailPage() {
   const [mapsReady, setMapsReady] = useState(false);
   const [mapError, setMapError] = useState('');
   const [routeInfo, setRouteInfo] = useState<{ distanceKm: number; durationMin: number; summary: string } | null>(null);
+  const [chatOpen] = useState(false);
+  const [conversationId] = useState('');
+  const [chatMessages, setChatMessages] = useState<ConversationMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatConnecting, setChatConnecting] = useState(false);
 
   const routeMapContainerRef = useRef<HTMLDivElement | null>(null);
   const routeMapRef = useRef<any>(null);
   const directionsServiceRef = useRef<any>(null);
   const directionsRendererRef = useRef<any>(null);
+  const socketRef = useRef<Socket | null>(null);
 
   const modeLabel = (mode?: 'intracity' | 'intercity') => (mode === 'intercity' ? 'Şehirler Arası' : 'Şehir İçi');
 
@@ -107,6 +139,13 @@ export function ShipmentDetailPage() {
     return 'info';
   };
 
+  const formatDateTime = (value?: string) => {
+    if (!value) return '-';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '-';
+    return date.toLocaleString('tr-TR');
+  };
+
   const load = async (options?: { silent?: boolean }) => {
     const silent = Boolean(options?.silent);
     if (!silent) setLoading(true);
@@ -119,8 +158,10 @@ export function ShipmentDetailPage() {
       try {
         const { data: me } = await api.get<ViewerProfile>('/users/me/profile');
         setViewerRole(me?.role);
+        setViewerUserId(String(me?.id || ''));
       } catch {
         setViewerRole(undefined);
+        setViewerUserId('');
       }
 
       try {
@@ -167,6 +208,10 @@ export function ShipmentDetailPage() {
   const isCarrierViewer = viewMode === 'carrier';
   const canViewMap = canViewOffers || isCarrierViewer;
   const desc = useMemo(() => parseDescription(shipment?.description), [shipment?.description]);
+  const recommendedVehicles = useMemo(
+    () => (shipment?.recommendedVehicleTypes || []).filter((item) => item?.name || item?.slug),
+    [shipment?.recommendedVehicleTypes],
+  );
   const sentOffers = useMemo(() => {
     if (canViewOffers) return [] as OfferLite[];
     if (offers.length) return offers;
@@ -177,6 +222,91 @@ export function ShipmentDetailPage() {
     if (isCarrierViewer) return sentOffers.length;
     return offers.length;
   }, [canViewOffers, isCarrierViewer, offers.length, sentOffers.length]);
+  const acceptedOfferForConversation = useMemo(() => {
+    if (isCarrierViewer) {
+      if (shipment?.myOffer && shipment.myOffer.status === 'accepted') return shipment.myOffer;
+      return null;
+    }
+    if (canViewOffers) return offers.find((offer) => offer.status === 'accepted') || null;
+    return null;
+  }, [isCarrierViewer, shipment?.myOffer, canViewOffers, offers]);
+  const canStartConversation = Boolean(
+    shipmentId &&
+      shipment?.status === 'matched' &&
+      acceptedOfferForConversation?._id,
+  );
+  const showConversationCard = Boolean((isCarrierViewer || canViewOffers) && canStartConversation);
+  const conversationPeer = useMemo(() => {
+    if (!showConversationCard || !shipment) return { title: 'Mesajlaşma', name: '-', phone: '-' };
+    if (isCarrierViewer) {
+      return {
+        title: 'İlan Sahibi Bilgileri',
+        name: shipment.listingOwner?.fullName || 'Yük Sahibi',
+        phone: shipment.listingOwner?.phone || '-',
+      };
+    }
+    return {
+      title: 'Taşıyıcı Bilgileri',
+      name: acceptedOfferForConversation?.carrierUserId?.fullName || 'Taşıyıcı',
+      phone: acceptedOfferForConversation?.carrierUserId?.phone || '-',
+    };
+  }, [showConversationCard, shipment, isCarrierViewer, acceptedOfferForConversation]);
+  const operationDetails = useMemo(
+    () => [
+      { label: 'Yük Yapısı', value: desc.loadType || '-' },
+      { label: 'Yükleme Tarihi', value: desc.loadDate || formatDateTime(shipment?.scheduledPickupAt) },
+      { label: 'Teslim Son Tarihi', value: desc.deadline || formatDateTime(shipment?.deliveryDeadlineAt) },
+      { label: 'Bütçe Aralığı', value: desc.budget || '-' },
+      { label: 'Yük Niteliği', value: desc.attributes || '-' },
+      {
+        label: 'Ölçü / Miktar',
+        value:
+          typeof shipment?.estimatedWeightKg === 'number' && shipment.estimatedWeightKg > 0
+            ? `${shipment.estimatedWeightKg} kg`
+            : typeof shipment?.estimatedVolumeM3 === 'number' && shipment.estimatedVolumeM3 > 0
+              ? `${shipment.estimatedVolumeM3} m3`
+              : typeof shipment?.pieceCount === 'number' && shipment.pieceCount > 0
+                ? `${shipment.pieceCount} adet`
+                : '-',
+      },
+      {
+        label: 'Ek Hizmetler',
+        value:
+          [
+            shipment?.needsPackaging ? 'Paketleme' : '',
+            shipment?.needsAssembly ? 'Montaj' : '',
+            shipment?.needsHelper ? 'Yardımcı Personel' : '',
+            shipment?.needsElevator ? 'Asansör' : '',
+          ]
+            .filter(Boolean)
+            .join(' • ') || '-',
+      },
+    ],
+    [
+      desc.loadType,
+      desc.loadDate,
+      desc.deadline,
+      desc.budget,
+      desc.attributes,
+      shipment?.scheduledPickupAt,
+      shipment?.deliveryDeadlineAt,
+      shipment?.estimatedWeightKg,
+      shipment?.estimatedVolumeM3,
+      shipment?.pieceCount,
+      shipment?.needsPackaging,
+      shipment?.needsAssembly,
+      shipment?.needsHelper,
+      shipment?.needsElevator,
+    ],
+  );
+  const addressDetails = useMemo(
+    () => [
+      { label: 'Çıkış Adresi', value: desc.pickupAddress || shipment?.pickupAddressText || '-' },
+      { label: 'Varış Adresi', value: desc.dropoffAddress || shipment?.dropoffAddressText || '-' },
+      { label: 'Ek Alanlar', value: desc.extra || '-' },
+    ],
+    [desc.pickupAddress, desc.dropoffAddress, desc.extra, shipment?.pickupAddressText, shipment?.dropoffAddressText],
+  );
 
   useEffect(() => {
     if (!isCarrierViewer || activeTab !== 'offers') return;
@@ -464,6 +594,94 @@ export function ShipmentDetailPage() {
     }
   };
 
+  const startConversation = async () => {
+    if (!shipmentId || !acceptedOfferForConversation?._id) {
+      setMessage('Mesajlaşma için kabul edilmiş teklif bulunamadı.');
+      return;
+    }
+
+    setChatLoading(true);
+    try {
+      const { data } = await api.post<{ _id?: string }>('/conversations', {
+        shipmentId,
+        offerId: acceptedOfferForConversation._id,
+      });
+      const nextConversationId = String(data?._id || '');
+      if (!nextConversationId) throw new Error('Konuşma başlatılamadı.');
+
+      navigate(`/mesajlar?conversationId=${encodeURIComponent(nextConversationId)}`);
+    } catch (error: any) {
+      setChatLoading(false);
+      setMessage(error?.response?.data?.message || error?.message || 'Mesajlaşma başlatılamadı.');
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  const sendConversationMessage = async () => {
+    const text = chatInput.trim();
+    if (!conversationId || !text) return;
+
+    setChatSending(true);
+    try {
+      const { data } = await api.post<ConversationMessage>(`/conversations/${conversationId}/messages`, {
+        messageType: 'text',
+        text,
+      });
+      setChatMessages((prev) => {
+        const exists = prev.some((item) => item._id === data?._id);
+        if (exists) return prev;
+        return [...prev, data];
+      });
+      setChatInput('');
+    } catch (error: any) {
+      setMessage(error?.response?.data?.message || 'Mesaj gönderilemedi.');
+    } finally {
+      setChatSending(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!chatOpen || !conversationId) return;
+    const token = localStorage.getItem('an_user_token');
+    if (!token) return;
+
+    setChatConnecting(true);
+    const socket = io(apiOrigin, {
+      transports: ['websocket'],
+      auth: { token },
+    });
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      setChatConnecting(false);
+      socket.emit('join:conversation', conversationId);
+    });
+    socket.on('disconnect', () => {
+      setChatConnecting(true);
+    });
+    socket.on('conversation:message', (payload: ConversationMessage) => {
+      if (String(payload?.conversationId || '') !== conversationId) return;
+      setChatMessages((prev) => {
+        const exists = prev.some((item) => item._id === payload?._id);
+        if (exists) return prev;
+        return [...prev, payload];
+      });
+      void api.patch(`/conversations/${conversationId}/read`).catch(() => undefined);
+    });
+
+    return () => {
+      try {
+        socket.emit('leave:conversation', conversationId);
+      } catch {
+        // no-op
+      }
+      socket.disconnect();
+      socketRef.current = null;
+      setChatConnecting(false);
+    };
+  }, [chatOpen, conversationId]);
+
   if (loading) {
     return (
       <section className="container py-5">
@@ -531,6 +749,26 @@ export function ShipmentDetailPage() {
                 </div>
               </div>
 
+              {showConversationCard ? (
+                <div className="panel-card p-3 mt-3">
+                  <div className="d-flex justify-content-between align-items-center gap-3 flex-wrap">
+                    <div>
+                      <small className="text-secondary d-block">{conversationPeer.title}</small>
+                      <strong className="d-block">{conversationPeer.name}</strong>
+                      <span className="text-secondary small">{conversationPeer.phone}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      disabled={!canStartConversation || chatLoading}
+                      onClick={() => void startConversation()}
+                    >
+                      {chatLoading ? 'Hazırlanıyor...' : 'Mesajlaşmaya Başla'}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
               <div className="row g-3 mt-1">
                 <div className="col-md-4">
                   <div className="shipment-mini-meta">
@@ -553,11 +791,11 @@ export function ShipmentDetailPage() {
               </div>
 
               <div className="shipment-description-box mt-3">
-                <small>Açıklama ve Notlar</small>
+                <small>Açıklama, Notlar ve Operasyon Bilgileri</small>
                 <div className="row g-3 mt-1">
                   {desc.summary ? (
                     <div className="col-md-12">
-                      <div className="border rounded-3 p-3 bg-white">
+                      <div className="shipment-note-card">
                         <strong className="d-block mb-1">Açıklama</strong>
                         <p className="mb-0">{desc.summary}</p>
                       </div>
@@ -565,30 +803,67 @@ export function ShipmentDetailPage() {
                   ) : null}
                   {desc.note ? (
                     <div className="col-md-12">
-                      <div className="border rounded-3 p-3 bg-white">
+                      <div className="shipment-note-card shipment-note-card-warn">
                         <strong className="d-block mb-1">Dikkat Edilmesi Gerekenler</strong>
                         <p className="mb-0">{desc.note}</p>
                       </div>
                     </div>
                   ) : null}
                   <div className="col-md-6">
-                    <div className="border rounded-3 p-3 bg-white h-100">
+                    <div className="shipment-subsection-card h-100">
                       <strong className="d-block mb-2">Operasyon Detayları</strong>
-                      <div className="small text-secondary">Yük Yapısı: <span className="text-dark">{desc.loadType || '-'}</span></div>
-                      <div className="small text-secondary">Yükleme Tarihi: <span className="text-dark">{desc.loadDate || '-'}</span></div>
-                      <div className="small text-secondary">Teslim Son Tarih: <span className="text-dark">{desc.deadline || '-'}</span></div>
-                      <div className="small text-secondary">Bütçe Aralığı: <span className="text-dark">{desc.budget || '-'}</span></div>
-                      <div className="small text-secondary">Yük Niteliği: <span className="text-dark">{desc.attributes || '-'}</span></div>
+                      <div className="shipment-detail-list">
+                        {operationDetails.map((item) => (
+                          <div className="shipment-detail-list-item" key={`op-${item.label}`}>
+                            <span>{item.label}</span>
+                            <strong>{item.value}</strong>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   </div>
                   <div className="col-md-6">
-                    <div className="border rounded-3 p-3 bg-white h-100">
+                    <div className="shipment-subsection-card h-100">
                       <strong className="d-block mb-2">Adres ve Ek Bilgiler</strong>
-                      <div className="small text-secondary">Çıkış Adresi: <span className="text-dark">{desc.pickupAddress || shipment.pickupAddressText || '-'}</span></div>
-                      <div className="small text-secondary">Varış Adresi: <span className="text-dark">{desc.dropoffAddress || shipment.dropoffAddressText || '-'}</span></div>
-                      <div className="small text-secondary">Ek Alanlar: <span className="text-dark">{desc.extra || '-'}</span></div>
+                      <div className="shipment-detail-list">
+                        {addressDetails.map((item) => (
+                          <div className="shipment-detail-list-item" key={`address-${item.label}`}>
+                            <span>{item.label}</span>
+                            <strong>{item.value}</strong>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   </div>
+                  {recommendedVehicles.length ? (
+                    <div className="col-12">
+                      <div className="shipment-subsection-card">
+                        <strong className="d-block mb-2">İlan İçin Uygun Araçlar</strong>
+                        <div className="shipment-recommended-list">
+                          {recommendedVehicles.map((vehicle) => (
+                            <span className="shipment-recommended-item" key={vehicle._id || vehicle.slug || vehicle.name}>
+                              <i className="bi bi-truck me-1"></i>
+                              {vehicle.name || vehicle.slug}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  {desc.rawLines.length > 1 ? (
+                    <div className="col-12">
+                      <div className="shipment-subsection-card">
+                        <strong className="d-block mb-2">Ek Metin Satırları</strong>
+                        <div className="shipment-recommended-list">
+                          {desc.rawLines.slice(1).map((line, idx) => (
+                            <span className="shipment-recommended-item" key={`raw-${idx}`}>
+                              {line}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </div>
@@ -814,6 +1089,66 @@ export function ShipmentDetailPage() {
                     )}
                   </tbody>
                 </table>
+              </div>
+            </div>
+          ) : null}
+
+          {chatOpen ? (
+            <div className="panel-card p-4 mt-3">
+              <div className="d-flex justify-content-between align-items-center gap-2 mb-3">
+                <h5 className="mb-0">Canlı Mesajlaşma</h5>
+                <span className={`shipment-status-pill ${chatConnecting ? 'tone-warning' : 'tone-success'}`}>
+                  {chatConnecting ? 'Bağlanıyor...' : 'Bağlandı'}
+                </span>
+              </div>
+
+              <div className="border rounded-3 p-3 mb-3" style={{ maxHeight: 320, overflowY: 'auto', background: '#faf9fe' }}>
+                {chatLoading ? (
+                  <div className="text-secondary small">Mesajlar yükleniyor...</div>
+                ) : chatMessages.length === 0 ? (
+                  <div className="text-secondary small">Henüz mesaj yok. İlk mesajı sen gönder.</div>
+                ) : (
+                  chatMessages.map((item) => {
+                    const senderId =
+                      typeof item.senderUserId === 'string'
+                        ? item.senderUserId
+                        : String(item.senderUserId?._id || '');
+                    const mine = Boolean(viewerUserId && senderId && viewerUserId === senderId);
+                    return (
+                      <div key={item._id} className={`d-flex mb-2 ${mine ? 'justify-content-end' : 'justify-content-start'}`}>
+                        <div
+                          className={`px-3 py-2 rounded-3 ${mine ? 'text-white' : ''}`}
+                          style={{ maxWidth: '80%', background: mine ? '#3E2C78' : '#ffffff', border: mine ? 'none' : '1px solid #ece7ff' }}
+                        >
+                          <div className="small">{item.text || '-'}</div>
+                          <div className={`small mt-1 ${mine ? 'text-white-50' : 'text-secondary'}`}>
+                            {item.createdAt
+                              ? new Date(item.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
+                              : ''}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              <div className="d-flex gap-2">
+                <input
+                  className="form-control"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      void sendConversationMessage();
+                    }
+                  }}
+                  placeholder="Mesajını yaz..."
+                />
+                <button type="button" className="btn btn-primary" disabled={chatSending || !chatInput.trim()} onClick={() => void sendConversationMessage()}>
+                  {chatSending ? 'Gönderiliyor...' : 'Gönder'}
+                </button>
               </div>
             </div>
           ) : null}

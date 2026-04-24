@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
-import { api } from '../lib/api';
+import { io } from 'socket.io-client';
+import { api, apiOrigin } from '../lib/api';
 import type { WebsiteSettings } from '../types/website';
 
 type Props = {
@@ -12,11 +13,20 @@ type CmsLink = {
   slug: string;
 };
 
+type ConversationInboxRow = {
+  _id: string;
+  unreadCount?: number;
+  lastMessageAt?: string;
+  lastMessage?: { text?: string } | null;
+};
+
 export function Header({ settings }: Props) {
   const location = useLocation();
   const [headerLinks, setHeaderLinks] = useState<CmsLink[]>([]);
   const [logoBroken, setLogoBroken] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
+  const [messageUnreadTotal, setMessageUnreadTotal] = useState(0);
+  const [lastMessagePreview, setLastMessagePreview] = useState('');
 
   const audience = useMemo(() => {
     try {
@@ -77,6 +87,53 @@ export function Header({ settings }: Props) {
   useEffect(() => {
     setNavOpen(false);
   }, [location.pathname]);
+
+  useEffect(() => {
+    const token = localStorage.getItem('an_user_token');
+    if (!token) {
+      setMessageUnreadTotal(0);
+      setLastMessagePreview('');
+      return;
+    }
+
+    let mounted = true;
+    const loadInbox = async () => {
+      try {
+        const { data } = await api.get<ConversationInboxRow[]>('/conversations/my');
+        if (!mounted) return;
+        const rows = Array.isArray(data) ? data : [];
+        const unreadTotal = rows.reduce((sum, row) => sum + Number(row.unreadCount || 0), 0);
+        setMessageUnreadTotal(unreadTotal);
+        const latest = [...rows].sort((a, b) => {
+          const aTs = new Date(a.lastMessageAt || 0).getTime();
+          const bTs = new Date(b.lastMessageAt || 0).getTime();
+          return bTs - aTs;
+        })[0];
+        setLastMessagePreview(String(latest?.lastMessage?.text || '').trim());
+      } catch {
+        if (!mounted) return;
+        setMessageUnreadTotal(0);
+      }
+    };
+
+    void loadInbox();
+
+    const socket = io(apiOrigin, {
+      transports: ['websocket'],
+      auth: { token },
+    });
+    socket.on('conversations:refresh', () => {
+      void loadInbox();
+    });
+    socket.on('connect', () => {
+      void loadInbox();
+    });
+
+    return () => {
+      mounted = false;
+      socket.disconnect();
+    };
+  }, [isAuthenticated, location.pathname]);
 
   return (
     <header className="site-header fixed-top">
@@ -143,6 +200,19 @@ export function Header({ settings }: Props) {
               ))}
               <li className="nav-item"><NavLink to="/app" className="nav-link" onClick={() => setNavOpen(false)}>Yük İşlemleri</NavLink></li>
               <li className="nav-item"><NavLink to="/blog" className="nav-link" onClick={() => setNavOpen(false)}>Blog</NavLink></li>
+              {isAuthenticated ? (
+                <li className="nav-item">
+                  <NavLink
+                    to="/mesajlar"
+                    className="btn btn-success nav-cta-btn nav-messages-btn ms-lg-2 d-inline-flex align-items-center gap-2"
+                    onClick={() => setNavOpen(false)}
+                    title={lastMessagePreview || 'Mesajlar'}
+                  >
+                    <span>Mesajlar</span>
+                    {messageUnreadTotal > 0 ? <span className="badge text-bg-danger">{messageUnreadTotal}</span> : null}
+                  </NavLink>
+                </li>
+              ) : null}
               {isAuthenticated ? (
                 <li className="nav-item">
                   <NavLink to="/hesabim" className="btn btn-primary nav-cta-btn ms-lg-2" onClick={() => setNavOpen(false)}>Hesabım</NavLink>

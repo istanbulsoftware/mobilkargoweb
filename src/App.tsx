@@ -7,6 +7,8 @@ import { AppPage } from './pages/AppPage';
 import { BlogPage } from './pages/BlogPage';
 import { ContactPage } from './pages/ContactPage';
 import { ContentPage } from './pages/ContentPage';
+import { ConversationPage } from './pages/ConversationPage';
+import { ConversationsPage } from './pages/ConversationsPage';
 import { HomePage } from './pages/HomePage';
 import { LoginPage } from './pages/LoginPage';
 import { NotFoundPage } from './pages/NotFoundPage';
@@ -55,6 +57,8 @@ function App() {
           <Route path="/home" element={<Navigate to="/" replace />} />
           <Route path="/app" element={<AppPage />} />
           <Route path="/hesabim" element={<AccountPage />} />
+          <Route path="/mesajlar" element={<ConversationsPage />} />
+          <Route path="/mesajlar/:conversationId" element={<ConversationPage />} />
           <Route path="/hesabim/yuk/:shipmentId" element={<ShipmentDetailPage />} />
           <Route path="/hesabim/yuk/:shipmentId/duzenle" element={<ShipmentEditPage />} />
           <Route path="/hesabim/arac/:vehicleId" element={<VehicleDetailPage />} />

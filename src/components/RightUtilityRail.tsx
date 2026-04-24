@@ -12,6 +12,7 @@ function resolveInitialTheme(): ThemeMode {
 
 export function RightUtilityRail() {
   const [mode, setMode] = useState<ThemeMode>('light');
+  const [showScrollTop, setShowScrollTop] = useState(false);
   const isDark = useMemo(() => mode === 'dark', [mode]);
 
   useEffect(() => {
@@ -23,6 +24,17 @@ export function RightUtilityRail() {
     document.documentElement.setAttribute('data-theme', mode);
     localStorage.setItem(THEME_KEY, mode);
   }, [mode]);
+
+  useEffect(() => {
+    const onScroll = () => {
+      setShowScrollTop(window.scrollY > 24);
+    };
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+    };
+  }, []);
 
   const toggleTheme = () => setMode((prev) => (prev === 'light' ? 'dark' : 'light'));
 
@@ -42,9 +54,11 @@ export function RightUtilityRail() {
         </button>
       </aside>
 
-      <button type="button" className="scroll-top-fab" onClick={scrollTop} aria-label="Sayfa başına dön">
-        Yukarı Çık
-      </button>
+      {showScrollTop ? (
+        <button type="button" className="scroll-top-fab" onClick={scrollTop} aria-label="Sayfa başına dön">
+          Yukarı Çık
+        </button>
+      ) : null}
     </>
   );
 }
