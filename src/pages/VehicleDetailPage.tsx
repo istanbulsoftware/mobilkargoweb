@@ -102,6 +102,12 @@ export function VehicleDetailPage() {
       <div className="d-flex justify-content-between align-items-center mb-3">
         <h1 className="shipment-page-title mb-0">Araç Detayı</h1>
         <div className="d-flex gap-2">
+          <Link
+            to={`/hesabim?panel=vehicle_docs&vehicleId=${encodeURIComponent(data.vehicle._id)}`}
+            className="btn btn-primary"
+          >
+            Bu Araca Belge Yükle
+          </Link>
           <Link to={`/hesabim/arac/${data.vehicle._id}/duzenle`} className="btn btn-outline-secondary">Düzenle</Link>
           <Link to="/hesabim" className="btn btn-outline-primary">Hesabım</Link>
         </div>

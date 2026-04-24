@@ -67,6 +67,26 @@ export function ShipmentEditPage() {
 
   const originDistrictOptions = useMemo(() => districtByCity[originCityId] || [], [districtByCity, originCityId]);
   const destinationDistrictOptions = useMemo(() => districtByCity[destinationCityId] || [], [districtByCity, destinationCityId]);
+  const originCityName = useMemo(() => cities.find((x) => x.id === originCityId)?.name || '', [cities, originCityId]);
+  const destinationCityName = useMemo(() => cities.find((x) => x.id === destinationCityId)?.name || '', [cities, destinationCityId]);
+  const computedTransportMode: 'intracity' | 'intercity' = useMemo(() => {
+    if (!originCityName || !destinationCityName) return 'intracity';
+    return originCityName === destinationCityName ? 'intracity' : 'intercity';
+  }, [originCityName, destinationCityName]);
+  const statusLabel = (value: ShipmentDetail['status']) => {
+    const map: Record<ShipmentDetail['status'], string> = {
+      draft: 'Taslak',
+      published: 'Yayında',
+      offer_collecting: 'Teklif Topluyor',
+      matched: 'Eşleşti',
+      cancelled: 'İptal',
+      completed: 'Tamamlandı',
+      suspended: 'Durduruldu',
+    };
+    return map[value] || value;
+  };
+  const modeLabel = (mode: 'intracity' | 'intercity') => (mode === 'intercity' ? 'Şehirler Arası' : 'Şehir İçi');
+  const titleCharCount = title.length;
 
   const loadDistricts = async (cityId: string) => {
     if (!cityId || districtByCity[cityId]) return;
@@ -158,12 +178,36 @@ export function ShipmentEditPage() {
     const originCity = cities.find((x) => x.id === originCityId)?.name;
     const destinationCity = cities.find((x) => x.id === destinationCityId)?.name;
 
-    if (!title.trim()) {
-      setMessage('İlan başlığı zorunludur.');
+    if (!title.trim() || title.trim().length < 3) {
+      setMessage('İlan başlığı en az 3 karakter olmalıdır.');
+      return;
+    }
+    if (/[\r\n]/.test(title)) {
+      setMessage('İlan başlığı tek satır olmalıdır.');
       return;
     }
     if (!originCity || !destinationCity) {
       setMessage('Çıkış ve varış şehirleri zorunludur.');
+      return;
+    }
+    if (scheduledAt && deliveryDeadlineAt) {
+      const start = new Date(scheduledAt).getTime();
+      const end = new Date(deliveryDeadlineAt).getTime();
+      if (!Number.isNaN(start) && !Number.isNaN(end) && end < start) {
+        setMessage('Teslim son tarihi, yükleme tarihinden önce olamaz.');
+        return;
+      }
+    }
+    if (estimatedWeightKg && Number(estimatedWeightKg) < 0) {
+      setMessage('Ağırlık negatif olamaz.');
+      return;
+    }
+    if (estimatedVolumeM3 && Number(estimatedVolumeM3) < 0) {
+      setMessage('Hacim negatif olamaz.');
+      return;
+    }
+    if (pieceCount && Number(pieceCount) < 0) {
+      setMessage('Parça sayısı negatif olamaz.');
       return;
     }
 
@@ -220,10 +264,26 @@ export function ShipmentEditPage() {
       {message ? <div className="alert alert-warning">{message}</div> : null}
 
       <div className="panel-card p-4">
+        <div className="shipment-edit-summary mb-4">
+          <div className="shipment-edit-summary-item">
+            <small>Taşıma Modu</small>
+            <strong>{modeLabel(computedTransportMode)}</strong>
+          </div>
+          <div className="shipment-edit-summary-item">
+            <small>Durum</small>
+            <strong>{statusLabel(status)}</strong>
+          </div>
+          <div className="shipment-edit-summary-item">
+            <small>Başlık Karakter</small>
+            <strong>{titleCharCount}/120</strong>
+          </div>
+        </div>
+
         <div className="row g-3">
           <div className="col-md-8">
             <label className="form-label">İlan Başlığı *</label>
             <input className="form-control" value={title} maxLength={120} onChange={(e) => setTitle(e.target.value.replace(/[\r\n]/g, ''))} />
+            <small className="text-secondary">Net, kısa ve tek satır başlık kullanın.</small>
           </div>
           <div className="col-md-4">
             <label className="form-label">Durum</label>
@@ -241,6 +301,7 @@ export function ShipmentEditPage() {
           <div className="col-12">
             <label className="form-label">İlan Açıklaması ve Notlar</label>
             <textarea className="form-control" rows={6} value={description} onChange={(e) => setDescription(e.target.value)} />
+            <small className="text-secondary">Yük detaylarını ve dikkat edilmesi gereken notları bu alanda güncelleyebilirsiniz.</small>
           </div>
 
           <div className="col-md-3">

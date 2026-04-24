@@ -32,18 +32,18 @@ export function RightUtilityRail() {
 
   return (
     <>
-      <aside className="right-utility-rail" aria-label="Sayfa araclari">
+      <aside className="right-utility-rail" aria-label="Sayfa araçları">
         <button type="button" className="rail-dot-btn" aria-label="Dekoratif nokta">
           <span />
         </button>
 
-        <button type="button" className="theme-toggle-pill" onClick={toggleTheme} aria-label="Tema degistir">
+        <button type="button" className="theme-toggle-pill" onClick={toggleTheme} aria-label="Tema değiştir">
           <span className="theme-toggle-icon"><i className={`bi ${isDark ? 'bi-moon-stars' : 'bi-brightness-high'}`} /></span>
         </button>
       </aside>
 
-      <button type="button" className="scroll-top-fab" onClick={scrollTop} aria-label="Sayfa basina don">
-        Yükari Cik
+      <button type="button" className="scroll-top-fab" onClick={scrollTop} aria-label="Sayfa başına dön">
+        Yukarı Çık
       </button>
     </>
   );

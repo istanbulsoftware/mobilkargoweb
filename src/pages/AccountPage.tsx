@@ -1,6 +1,8 @@
 ﻿import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useNavigate } from 'react-router-dom';
+import { useSearchParams } from 'react-router-dom';
+import Swal from 'sweetalert2';
 import { MediaLightbox } from '../components/MediaLightbox';
 import { api, toAbsoluteAssetUrl } from '../lib/api';
 
@@ -118,6 +120,7 @@ type SubscriptionPurchase = {
 
 export function AccountPage() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [saveMessage, setSaveMessage] = useState('');
@@ -129,6 +132,7 @@ export function AccountPage() {
   const [carrierFeed, setCarrierFeed] = useState<CarrierFeedShipment[]>([]);
   const [carrierOffers, setCarrierOffers] = useState<CarrierOffer[]>([]);
   const [carrierOfferTab, setCarrierOfferTab] = useState<'all' | 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'other'>('all');
+  const [shipperShipmentTab, setShipperShipmentTab] = useState<'all' | 'published' | 'offer_collecting' | 'matched' | 'completed' | 'cancelled' | 'other'>('all');
   const [myVehicles, setMyVehicles] = useState<MyVehicle[]>([]);
   const [offerDraft, setOfferDraft] = useState<Record<string, { vehicleId: string; amount: string; note: string }>>({});
   const [offerActionLoading, setOfferActionLoading] = useState('');
@@ -167,9 +171,36 @@ export function AccountPage() {
   const [editWorkingModes, setEditWorkingModes] = useState<Array<'intracity' | 'intercity'>>([]);
 
   const token = localStorage.getItem('an_user_token');
+  const panelParam = searchParams.get('panel');
+  const vehicleIdParam = searchParams.get('vehicleId');
 
   const modeLabel = (mode?: 'intracity' | 'intercity') =>
     mode === 'intercity' ? 'Şehirler Arasi' : 'Şehir Ici';
+
+  const shipmentStatusLabel = (status?: string) => {
+    const map: Record<string, string> = {
+      draft: 'Taslak',
+      published: 'Yayinda',
+      offer_collecting: 'Teklif Topluyor',
+      matched: 'Eslesti',
+      completed: 'Tamamlandi',
+      cancelled: 'Iptal',
+      suspended: 'Durduruldu',
+    };
+    return map[status || ''] || status || '-';
+  };
+
+  const notifyError = (text: string) => {
+    void Swal.fire({ icon: 'error', title: 'Hata', text, confirmButtonText: 'Tamam' });
+  };
+
+  const notifySuccess = (text: string) => {
+    void Swal.fire({ icon: 'success', title: 'Başarılı', text, confirmButtonText: 'Tamam' });
+  };
+
+  const notifyWarning = (text: string) => {
+    void Swal.fire({ icon: 'warning', title: 'Uyarı', text, confirmButtonText: 'Tamam' });
+  };
 
   const districtOptions = useMemo(() => districtByCity[selectedCityId] || [], [districtByCity, selectedCityId]);
   const vehicleDistrictOptions = useMemo(() => districtByCity[vehicleServiceCityId] || [], [districtByCity, vehicleServiceCityId]);
@@ -192,6 +223,7 @@ export function AccountPage() {
     const load = async () => {
       if (!token) {
         setMessage('Hesabım sayfasi için once giris yapmalisiniz.');
+        notifyWarning('Hesabım sayfası için önce giriş yapmalısınız.');
         setLoading(false);
         return;
       }
@@ -255,7 +287,9 @@ export function AccountPage() {
           setSubscriptionPurchases([]);
         }
       } catch (error: any) {
-        setMessage(error?.response?.data?.message || 'Hesap verileri yüklenemedi.');
+        const errText = error?.response?.data?.message || 'Hesap verileri yüklenemedi.';
+        setMessage(errText);
+        notifyError(errText);
       } finally {
         setLoading(false);
       }
@@ -302,10 +336,35 @@ export function AccountPage() {
     }
   }, [myVehicles, selectedDocVehicleId]);
 
+  useEffect(() => {
+    if (!vehicleIdParam) return;
+    if (!myVehicles.length) return;
+    const exists = myVehicles.some((v) => v._id === vehicleIdParam);
+    if (!exists) return;
+    setSelectedDocVehicleId(vehicleIdParam);
+    setActivePanel('vehicle_docs');
+  }, [vehicleIdParam, myVehicles]);
+  useEffect(() => {
+    if (!profile) return;
+    if (!panelParam) return;
+
+    const carrierPanels = new Set(['overview', 'profile', 'feed', 'offers', 'vehicle_add', 'vehicle_list', 'vehicle_docs']);
+    const shipperPanels = new Set(['overview', 'profile', 'shipments']);
+
+    if (profile.role === 'carrier' && carrierPanels.has(panelParam)) {
+      setActivePanel(panelParam as 'overview' | 'profile' | 'feed' | 'offers' | 'vehicle_add' | 'vehicle_list' | 'vehicle_docs');
+      return;
+    }
+    if (profile.role === 'shipper' && shipperPanels.has(panelParam)) {
+      setActivePanel(panelParam as 'overview' | 'profile' | 'shipments');
+    }
+  }, [panelParam, profile]);
+
   const saveProfile = async () => {
     if (!profile) return;
     if (!editFullName.trim()) {
       setSaveMessage('Ad soyad zorunlu.');
+      notifyWarning('Ad soyad zorunlu.');
       return;
     }
     setSaving(true);
@@ -325,8 +384,11 @@ export function AccountPage() {
       const fresh = await api.get<UserProfile>('/users/me/profile');
       setProfile(fresh.data);
       setSaveMessage('Profil bilgileri güncellendi.');
+      notifySuccess('Profil bilgileri güncellendi.');
     } catch (error: any) {
-      setSaveMessage(error?.response?.data?.message || 'Profil güncellenemedi.');
+      const errText = error?.response?.data?.message || 'Profil güncellenemedi.';
+      setSaveMessage(errText);
+      notifyError(errText);
     } finally {
       setSaving(false);
     }
@@ -344,6 +406,13 @@ export function AccountPage() {
     if (carrierOfferTab === 'withdrawn') return carrierOffers.filter((x) => x.status === 'withdrawn');
     return carrierOffers.filter((x) => ['cancelled', 'expired'].includes(x.status));
   }, [carrierOffers, carrierOfferTab]);
+  const filteredShipperShipments = useMemo(() => {
+    if (shipperShipmentTab === 'all') return latestShipments;
+    if (shipperShipmentTab === 'other') {
+      return latestShipments.filter((x) => !['published', 'offer_collecting', 'matched', 'completed', 'cancelled'].includes(x.status));
+    }
+    return latestShipments.filter((x) => x.status === shipperShipmentTab);
+  }, [latestShipments, shipperShipmentTab]);
 
   const getDefaultVehicleForShipment = (shipment: CarrierFeedShipment) => {
     if (!activeVehicles.length) return '';
@@ -381,6 +450,7 @@ export function AccountPage() {
     const draft = offerDraft[shipmentId] || { vehicleId: fallbackVehicleId || '', amount: '', note: '' };
     if (!draft?.vehicleId || !draft?.amount) {
       setMessage('Teklif için arac ve tutar secimi zorunlu.');
+      notifyWarning('Teklif için araç ve tutar seçimi zorunlu.');
       return;
     }
     setOfferActionLoading(shipmentId);
@@ -394,8 +464,11 @@ export function AccountPage() {
       });
       await refreshCarrierData();
       setMessage('Teklif başarıyla gönderildi.');
+      notifySuccess('Teklif başarıyla gönderildi.');
     } catch (error: any) {
-      setMessage(error?.response?.data?.message || 'Teklif gönderilemedi.');
+      const errText = error?.response?.data?.message || 'Teklif gönderilemedi.';
+      setMessage(errText);
+      notifyError(errText);
     } finally {
       setOfferActionLoading('');
     }
@@ -408,8 +481,11 @@ export function AccountPage() {
       await api.patch(`/offers/${offerId}/withdraw`);
       await refreshCarrierData();
       setMessage('Teklif geri cekildi.');
+      notifySuccess('Teklif geri çekildi.');
     } catch (error: any) {
-      setMessage(error?.response?.data?.message || 'Teklif geri cekilemedi.');
+      const errText = error?.response?.data?.message || 'Teklif geri cekilemedi.';
+      setMessage(errText);
+      notifyError(errText);
     } finally {
       setOfferActionLoading('');
     }
@@ -433,28 +509,34 @@ export function AccountPage() {
     setVehicleMessage('');
     if (!vehicleTypeSlug) {
       setVehicleMessage('Araç tipi secmelisiniz.');
+      notifyWarning('Araç tipi seçmelisiniz.');
       return;
     }
     if (!vehiclePlate.trim()) {
       setVehicleMessage('Plaka zorunlu.');
+      notifyWarning('Plaka zorunlu.');
       return;
     }
     if (!vehicleServiceCityId) {
       setVehicleMessage('Hizmet sehri secmelisiniz.');
+      notifyWarning('Hizmet şehri seçmelisiniz.');
       return;
     }
     if (!vehicleModes.length) {
       setVehicleMessage('En az bir tasima modu secmelisiniz.');
+      notifyWarning('En az bir taşıma modu seçmelisiniz.');
       return;
     }
     if (!vehicleSupportedLoadSlugs.length) {
       setVehicleMessage('En az bir desteklenen yuk tipi secmelisiniz.');
+      notifyWarning('En az bir desteklenen yük tipi seçmelisiniz.');
       return;
     }
 
     const cityName = cities.find((c) => c.id === vehicleServiceCityId)?.name;
     if (!cityName) {
       setVehicleMessage('Hizmet sehri gecersiz.');
+      notifyWarning('Hizmet şehri geçersiz.');
       return;
     }
 
@@ -476,9 +558,12 @@ export function AccountPage() {
       await refreshCarrierData();
       resetVehicleForm();
       setVehicleMessage('Araç basariyla eklendi. Inceleme süreçi için belge adimina gecebilirsiniz.');
+      notifySuccess('Araç başarıyla eklendi. İnceleme süreci için belge adımına geçebilirsiniz.');
       setActivePanel('vehicle_list');
     } catch (error: any) {
-      setVehicleMessage(error?.response?.data?.message || 'Araç eklenemedi.');
+      const errText = error?.response?.data?.message || 'Araç eklenemedi.';
+      setVehicleMessage(errText);
+      notifyError(errText);
     } finally {
       setVehicleSaving(false);
     }
@@ -489,18 +574,30 @@ export function AccountPage() {
     return myDocuments.filter((d) => String(d.vehicleId) === selectedDocVehicleId);
   }, [myDocuments, selectedDocVehicleId]);
 
+  const hasActiveSelectedDocument = useMemo(() => {
+    if (!selectedDocVehicleId || !documentType) return false;
+    return myDocuments.some((d) => {
+      if (String(d.vehicleId) !== selectedDocVehicleId) return false;
+      if (d.documentType !== documentType) return false;
+      return !['rejected', 'revision_required', 'expired'].includes(String(d.status || ''));
+    });
+  }, [myDocuments, selectedDocVehicleId, documentType]);
+
   const submitVehicleDocument = async () => {
     setDocumentMessage('');
     if (!selectedDocVehicleId) {
-      setDocumentMessage('Belge yÃ¼klenecek aracÄ± seÃ§melisiniz.');
+      setDocumentMessage('Belge yüklenecek aracı seçmelisiniz.');
+      notifyWarning('Belge yüklenecek aracı seçmelisiniz.');
       return;
     }
     if (!documentType.trim()) {
-      setDocumentMessage('Belge tipi seÃ§melisiniz.');
+      setDocumentMessage('Belge tipi seçmelisiniz.');
+      notifyWarning('Belge tipi seçmelisiniz.');
       return;
     }
     if (!documentFile) {
-      setDocumentMessage('Dosya seÃ§melisiniz.');
+      setDocumentMessage('Dosya seçmelisiniz.');
+      notifyWarning('Dosya seçmelisiniz.');
       return;
     }
 
@@ -515,9 +612,12 @@ export function AccountPage() {
       });
       await refreshCarrierData();
       setDocumentFile(null);
-      setDocumentMessage('AraÃ§ belgesi yÃ¼klendi.');
+      setDocumentMessage('Araç belgesi yüklendi.');
+      notifySuccess('Araç belgesi yüklendi.');
     } catch (error: any) {
-      setDocumentMessage(error?.response?.data?.message || 'Belge yÃ¼klenemedi.');
+      const errText = error?.response?.data?.message || 'Belge yüklenemedi.';
+      setDocumentMessage(errText);
+      notifyError(errText);
     } finally {
       setDocumentUploading(false);
     }
@@ -566,6 +666,11 @@ export function AccountPage() {
           <Link to="/app" className="btn btn-outline-primary">
             {profile?.role === 'carrier' ? 'Yük Havuzuna Git' : 'Yeni Yük Oluştur'}
           </Link>
+          {profile?.role === 'carrier' ? (
+            <Link to="/hesabim?panel=vehicle_docs" className="btn btn-primary">
+              Araç Belgeleri
+            </Link>
+          ) : null}
         </div>
       </div>
 
@@ -909,6 +1014,29 @@ export function AccountPage() {
                 <h4 className="fw-bold mb-0">Oluşturdugum Yükler</h4>
                 <span className="text-secondary small">Son {latestShipments.length} kayit</span>
               </div>
+              <div className="carrier-tabs mb-3">
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'all' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('all')}>
+                  Tumu <span className="carrier-tab-count">{latestShipments.length}</span>
+                </button>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'published' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('published')}>
+                  Yayinda <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'published').length}</span>
+                </button>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'offer_collecting' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('offer_collecting')}>
+                  Teklif Topluyor <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'offer_collecting').length}</span>
+                </button>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'matched' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('matched')}>
+                  Eslesen <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'matched').length}</span>
+                </button>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'completed' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('completed')}>
+                  Tamamlanan <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'completed').length}</span>
+                </button>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'cancelled' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('cancelled')}>
+                  Iptal <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'cancelled').length}</span>
+                </button>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'other' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('other')}>
+                  Diger <span className="carrier-tab-count">{latestShipments.filter((x) => !['published', 'offer_collecting', 'matched', 'completed', 'cancelled'].includes(x.status)).length}</span>
+                </button>
+              </div>
               <div className="table-responsive">
                 <table className="table align-middle">
                   <thead>
@@ -923,17 +1051,17 @@ export function AccountPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {latestShipments.length === 0 ? (
+                    {filteredShipperShipments.length === 0 ? (
                       <tr>
                         <td colSpan={7} className="text-secondary">Henuz olusturulmus yuk bulunmuyor.</td>
                       </tr>
                     ) : (
-                      latestShipments.map((item) => (
+                      filteredShipperShipments.map((item) => (
                         <tr key={item._id}>
                           <td>{item.title}</td>
                           <td>{`${item.pickupCity || '-'} / ${item.dropoffCity || '-'}`}</td>
                           <td>{modeLabel(item.transportMode)}</td>
-                          <td><span className="badge text-bg-light border">{item.status}</span></td>
+                          <td><span className="badge text-bg-light border">{shipmentStatusLabel(item.status)}</span></td>
                           <td>{item.offerStats?.total ?? 0}</td>
                           <td>{new Date(item.createdAt).toLocaleDateString('tr-TR')}</td>
                           <td className="text-end">
@@ -1315,6 +1443,12 @@ export function AccountPage() {
                             <div className="d-flex gap-2 justify-content-end">
                               <Link className="btn btn-sm btn-outline-primary" to={`/hesabim/arac/${v._id}`}>Detay</Link>
                               <Link className="btn btn-sm btn-outline-secondary" to={`/hesabim/arac/${v._id}/duzenle`}>Duzenle</Link>
+                              <Link
+                                className="btn btn-sm btn-primary"
+                                to={`/hesabim?panel=vehicle_docs&vehicleId=${encodeURIComponent(v._id)}`}
+                              >
+                                Belge Ekle
+                              </Link>
                             </div>
                           </td>
                         </tr>
@@ -1366,16 +1500,28 @@ export function AccountPage() {
                 </div>
                 <div className="col-md-4">
                   <label className="form-label">Dosya *</label>
-                  <input
-                    className="form-control"
-                    type="file"
-                    onChange={(e) => setDocumentFile(e.target.files?.[0] || null)}
-                  />
+                  <div className="d-flex gap-2 align-items-center">
+                    <input
+                      className="form-control"
+                      type="file"
+                      disabled={hasActiveSelectedDocument}
+                      onChange={(e) => setDocumentFile(e.target.files?.[0] || null)}
+                    />
+                    {!hasActiveSelectedDocument ? (
+                      <button
+                        type="button"
+                        className="btn btn-primary flex-shrink-0"
+                        disabled={documentUploading}
+                        onClick={() => void submitVehicleDocument()}
+                      >
+                        {documentUploading ? 'Yükleniyor...' : 'Dosyayı Gönder'}
+                      </button>
+                    ) : (
+                      <span className="badge text-bg-success flex-shrink-0">Seçilen belge zaten yüklü</span>
+                    )}
+                  </div>
                 </div>
                 <div className="col-12 d-flex gap-2 align-items-center">
-                  <button type="button" className="btn btn-primary" disabled={documentUploading} onClick={() => void submitVehicleDocument()}>
-                    {documentUploading ? 'Yükleniyor...' : 'Belge Yükle'}
-                  </button>
                   {documentMessage ? <span className="text-secondary small">{documentMessage}</span> : null}
                 </div>
               </div>
@@ -1511,6 +1657,15 @@ export function AccountPage() {
     </section>
   );
 }
+
+
+
+
+
+
+
+
+
 
 
 
