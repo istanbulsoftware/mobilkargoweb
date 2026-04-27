@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { io, type Socket } from 'socket.io-client';
 import Swal from 'sweetalert2';
 import { MediaLightbox } from '../components/MediaLightbox';
+import { NearbyLoadsMapPanel } from '../components/NearbyLoadsMapPanel';
 import { api, apiOrigin } from '../lib/api';
 
 type UserProfile = {
@@ -65,11 +66,24 @@ type FormOptionsResponse = {
 type CarrierFeedShipment = {
   _id: string;
   title: string;
+  status?: string;
+  description?: string;
+  loadTypeSlug?: string;
+  cargoTypeId?: string | { _id?: string; slug?: string; name?: string };
+  offerCount?: number;
   transportMode: 'intracity' | 'intercity';
   pickupCity?: string;
   pickupDistrict?: string;
   dropoffCity?: string;
   dropoffDistrict?: string;
+  routeDistanceKm?: number;
+  routeDurationMin?: number;
+  scheduledPickupAt?: string;
+  estimatedWeightKg?: number;
+  estimatedVolumeM3?: number;
+  pieceCount?: number;
+  isUrgent?: boolean;
+  createdAt?: string;
   pickupGeo?: { type?: 'Point'; coordinates?: [number, number] };
   dropoffGeo?: { type?: 'Point'; coordinates?: [number, number] };
   hasMyOffer?: boolean;
@@ -136,27 +150,6 @@ type AppConversationMessage = {
   createdAt?: string;
 };
 
-type CarrierVehicle = {
-  _id: string;
-  status: string;
-  plateMasked?: string;
-  brand?: string;
-  model?: string;
-  vehicleTypeId?: { _id?: string; name?: string; slug?: string };
-};
-
-type CarrierLoadAlert = {
-  _id: string;
-  name: string;
-  transportMode: 'all' | 'intracity' | 'intercity';
-  city?: string;
-  district?: string;
-  loadTypeSlug?: string;
-  isActive: boolean;
-  createdAt?: string;
-  updatedAt?: string;
-};
-
 type LookupLoadType = {
   key: string;
   label: string;
@@ -186,6 +179,24 @@ type ResolvedLocationInfo = {
   lng?: number;
 };
 
+type RegisterContractComplianceItem = {
+  _id: string;
+  slug: string;
+  title: string;
+  summary?: string;
+  isRequiredOnRegister?: boolean;
+  updatedAt?: string | null;
+  latestAcceptedAt?: string | null;
+  needsAcceptance?: boolean;
+};
+
+type RegisterContractComplianceResponse = {
+  role?: 'shipper' | 'carrier';
+  compliant?: boolean;
+  pendingCount?: number;
+  pendingContracts?: RegisterContractComplianceItem[];
+};
+
 const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '').trim();
 
 const MODE_LABEL: Record<'intracity' | 'intercity', string> = {
@@ -193,12 +204,21 @@ const MODE_LABEL: Record<'intracity' | 'intercity', string> = {
   intercity: 'Şehirler Arası',
 };
 
+const SHIPMENT_COMPLAINT_REASONS: Array<{ value: string; label: string }> = [
+  { value: 'shipment_fraud', label: 'Sahte / yanıltıcı ilan' },
+  { value: 'shipment_wrong_info', label: 'İlan bilgileri hatalı' },
+  { value: 'shipment_spam_duplicate', label: 'Spam / mükerrer ilan' },
+  { value: 'shipment_illegal_prohibited', label: 'Yasak / uygunsuz içerik' },
+  { value: 'shipment_contact_abuse', label: 'Taciz / uygunsuz iletişim' },
+  { value: 'shipment_other', label: 'Diğer' },
+];
+
 const OFFER_TABS = [
   { key: 'pool', label: 'Yük Havuzu' },
+  { key: 'nearby_map', label: 'Haritada Göster' },
   { key: 'active_jobs', label: 'Aktif Taşımalar' },
-  { key: 'offered', label: 'Teklif Verdiklerim' },
-  { key: 'offers', label: 'Tekliflerim' },
-  { key: 'alerts', label: 'Yük Gelince Bildir' },
+  { key: 'offered', label: 'Teklif Verdiğim İlanlar' },
+  { key: 'offers', label: 'Teklif Kayıtlarım' },
 ] as const;
 
 const EMPTY_CARRIER_JOBS: CarrierJobsResponse = {
@@ -283,6 +303,33 @@ const SEGMENTS: Array<{
 ];
 
 const formatDate = (value?: string) => (value ? new Date(value).toLocaleString('tr-TR') : '-');
+const formatTryCurrency = (value?: number) => {
+  if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+  return new Intl.NumberFormat('tr-TR', {
+    style: 'currency',
+    currency: 'TRY',
+    maximumFractionDigits: 0,
+  }).format(value);
+};
+const offerStatusLabel = (status?: string) => {
+  const map: Record<string, string> = {
+    submitted: 'Gönderildi',
+    updated: 'Güncellendi',
+    accepted: 'Kabul Edildi',
+    rejected: 'Reddedildi',
+    withdrawn: 'Geri Çekildi',
+    cancelled: 'İptal',
+    expired: 'Süresi Doldu',
+  };
+  return map[status || ''] || status || '-';
+};
+
+const offerStatusPillTone = (status?: string) => {
+  if (status === 'accepted') return 'tone-success';
+  if (['rejected', 'withdrawn', 'cancelled', 'expired'].includes(status || '')) return 'tone-danger';
+  if (['submitted', 'updated'].includes(status || '')) return 'tone-warning';
+  return 'tone-neutral';
+};
 
 const trUpper = (value?: string) => (value || '').trim().toLocaleUpperCase('tr-TR');
 
@@ -347,7 +394,115 @@ export function AppPage() {
   const notifyWarning = (text: string) => {
     void Swal.fire({ icon: 'warning', title: 'Uyarı', text, confirmButtonText: 'Tamam' });
   };
+  const askUpdatedRegisterContractsConsent = async (items: RegisterContractComplianceItem[]) => {
+    if (!items.length) return [];
+
+    const contractRows = items
+      .map((item, index) => {
+        const requiredBadge = item.isRequiredOnRegister
+          ? '<span style="font-size:11px;padding:2px 8px;border-radius:999px;background:#ffe8c2;color:#8a5c00;font-weight:700;">Zorunlu</span>'
+          : '<span style="font-size:11px;padding:2px 8px;border-radius:999px;background:#e9f4ff;color:#22598a;font-weight:700;">Opsiyonel</span>';
+        return `
+          <div style="padding:10px 12px;border:1px solid #e8eaf1;border-radius:12px;margin-bottom:10px;">
+            <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+              <input type="checkbox" class="updated-contract-check" data-contract-slug="${item.slug}" checked />
+              <span style="display:block;text-align:left;">
+                <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <strong>${index + 1}. ${item.title}</strong>
+                  ${requiredBadge}
+                </span>
+                ${item.summary ? `<small style="display:block;color:#5b6475;margin-top:2px;">${item.summary}</small>` : ''}
+                <a href="/content/${item.slug}" target="_blank" rel="noreferrer" style="font-size:12px;">Metni görüntüle</a>
+              </span>
+            </label>
+          </div>
+        `;
+      })
+      .join('');
+
+    const result = await Swal.fire({
+      icon: 'warning',
+      title: 'Sözleşmeler Güncellendi',
+      html: `
+        <div style="text-align:left">
+          <p style="margin-bottom:12px;">Yük işlemlerine devam etmek için güncellenen sözleşmeleri tekrar onaylamanız gerekiyor.</p>
+          ${contractRows}
+        </div>
+      `,
+      showCancelButton: true,
+      allowOutsideClick: false,
+      allowEscapeKey: false,
+      confirmButtonText: 'Onayla ve Devam Et',
+      cancelButtonText: 'Çıkış Yap',
+      preConfirm: () => {
+        const checked = Array.from(document.querySelectorAll<HTMLInputElement>('.updated-contract-check:checked')).map(
+          (el) => String(el.dataset.contractSlug || '').trim(),
+        );
+        const allPendingSlugs = items.map((item) => item.slug).filter(Boolean);
+        const missingAny = allPendingSlugs.filter((slug) => !checked.includes(slug));
+        if (missingAny.length) {
+          Swal.showValidationMessage('Devam etmek için güncellenen tüm sözleşmeleri onaylamalısınız.');
+          return null;
+        }
+        return checked.filter(Boolean);
+      },
+    });
+
+    if (!result.isConfirmed) return null;
+    return Array.isArray(result.value) ? result.value : [];
+  };
+  const openShipmentComplaintModal = async (shipment: CarrierFeedShipment) => {
+    const optionsHtml = SHIPMENT_COMPLAINT_REASONS.map(
+      (item) => `<option value="${item.value}">${item.label}</option>`,
+    ).join('');
+
+    const result = await Swal.fire({
+      title: 'İlanı Şikayet Et',
+      html: `
+        <div style="text-align:left;display:flex;flex-direction:column;gap:10px;">
+          <label for="shipment-complaint-reason" style="font-weight:600;">Şikayet Konusu</label>
+          <select id="shipment-complaint-reason" class="swal2-input" style="margin:0;width:100%;">
+            <option value="">Lütfen seçiniz</option>
+            ${optionsHtml}
+          </select>
+          <label for="shipment-complaint-description" style="font-weight:600;">Açıklama</label>
+          <textarea id="shipment-complaint-description" class="swal2-textarea" style="margin:0;width:100%;" maxlength="600" placeholder="Şikayet sebebinizi kısa ve net şekilde yazın"></textarea>
+        </div>
+      `,
+      confirmButtonText: 'Şikayeti Gönder',
+      cancelButtonText: 'Vazgeç',
+      showCancelButton: true,
+      focusConfirm: false,
+      preConfirm: () => {
+        const reasonEl = document.getElementById('shipment-complaint-reason') as HTMLSelectElement | null;
+        const descEl = document.getElementById('shipment-complaint-description') as HTMLTextAreaElement | null;
+        const reasonType = reasonEl?.value?.trim() || '';
+        const description = descEl?.value?.trim() || '';
+        if (!reasonType) {
+          Swal.showValidationMessage('Lütfen şikayet konusu seçiniz.');
+          return null;
+        }
+        if (description.length < 5) {
+          Swal.showValidationMessage('Açıklama en az 5 karakter olmalı.');
+          return null;
+        }
+        return { reasonType, description };
+      },
+    });
+
+    if (!result.isConfirmed || !result.value) return;
+    try {
+      await api.post(`/shipments/${shipment._id}/complaints`, result.value);
+      notifySuccess('Şikayetiniz alındı. İnceleme sonrası değerlendirilecektir.');
+    } catch (error: any) {
+      const errText = error?.response?.data?.message || 'Şikayet gönderilemedi.';
+      notifyError(errText);
+    }
+  };
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [registerContractPending, setRegisterContractPending] = useState<RegisterContractComplianceItem[]>([]);
+  const [registerContractChecking, setRegisterContractChecking] = useState(false);
+  const [registerContractSaving, setRegisterContractSaving] = useState(false);
 
   const [cities, setCities] = useState<CityOption[]>([]);
   const [districtByCity, setDistrictByCity] = useState<Record<string, DistrictOption[]>>({});
@@ -411,31 +566,25 @@ export function AppPage() {
   const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
-  const [creationMode, setCreationMode] = useState<'quick' | 'detailed' | null>(null);
+  const [creationMode, setCreationMode] = useState<'quick' | 'detailed' | null>('quick');
 
   const [carrierTab, setCarrierTab] = useState<(typeof OFFER_TABS)[number]['key']>('pool');
   const [carrierFeed, setCarrierFeed] = useState<CarrierFeedShipment[]>([]);
   const [carrierOffers, setCarrierOffers] = useState<CarrierOffer[]>([]);
   const [carrierJobs, setCarrierJobs] = useState<CarrierJobsResponse>(EMPTY_CARRIER_JOBS);
-  const [carrierVehicles, setCarrierVehicles] = useState<CarrierVehicle[]>([]);
-  const [carrierAlerts, setCarrierAlerts] = useState<CarrierLoadAlert[]>([]);
   const [carrierLoadTypes, setCarrierLoadTypes] = useState<LookupLoadType[]>([]);
-  const [offerDraft, setOfferDraft] = useState<Record<string, { vehicleId: string; amount: string; note: string }>>({});
-  const [offerActionLoading, setOfferActionLoading] = useState('');
-  const [alertActionLoading, setAlertActionLoading] = useState('');
-  const [alertEditId, setAlertEditId] = useState('');
-  const [alertName, setAlertName] = useState('');
-  const [alertMode, setAlertMode] = useState<'all' | 'intracity' | 'intercity'>('all');
-  const [alertCityId, setAlertCityId] = useState('');
-  const [alertDistrict, setAlertDistrict] = useState('');
-  const [alertLoadTypeSlug, setAlertLoadTypeSlug] = useState('');
   const [carrierFilterMode, setCarrierFilterMode] = useState<'all' | 'intracity' | 'intercity'>('all');
   const [carrierFilterCityId, setCarrierFilterCityId] = useState('');
   const [carrierFilterDistrict, setCarrierFilterDistrict] = useState('');
+  const [carrierFiltersOpen, setCarrierFiltersOpen] = useState(true);
+  const [carrierSortMode, setCarrierSortMode] = useState<'newest' | 'oldest' | 'nearest' | 'farthest' | 'most_offers'>(
+    'newest',
+  );
   const [carrierNearbyLoading, setCarrierNearbyLoading] = useState(false);
   const [carrierNearbyLabel, setCarrierNearbyLabel] = useState('');
   const [carrierNearbyCenter, setCarrierNearbyCenter] = useState<{ lat: number; lng: number } | null>(null);
-  const [carrierRadiusKm, setCarrierRadiusKm] = useState(25);
+  const [carrierRadiusKm, setCarrierRadiusKm] = useState(50);
+  const carrierAutoNearbyAppliedRef = useRef(false);
   const [chatConversationId, setChatConversationId] = useState('');
   const [chatMessages, setChatMessages] = useState<AppConversationMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
@@ -446,12 +595,10 @@ export function AppPage() {
 
   const segmentConfig = useMemo(() => SEGMENTS.find((x) => x.key === segment) || SEGMENTS[0], [segment]);
 
-  const alertDistricts = useMemo(() => districtByCity[alertCityId] || [], [districtByCity, alertCityId]);
   const carrierFilterDistricts = useMemo(() => districtByCity[carrierFilterCityId] || [], [districtByCity, carrierFilterCityId]);
 
   const originCityName = useMemo(() => cities.find((x) => x.id === originCityId)?.name || '', [cities, originCityId]);
   const destinationCityName = useMemo(() => cities.find((x) => x.id === destinationCityId)?.name || '', [cities, destinationCityId]);
-  const alertCityName = useMemo(() => cities.find((x) => x.id === alertCityId)?.name || '', [cities, alertCityId]);
   const carrierFilterCityName = useMemo(
     () => cities.find((x) => x.id === carrierFilterCityId)?.name || '',
     [cities, carrierFilterCityId],
@@ -543,6 +690,38 @@ export function AppPage() {
     carrierRadiusKm,
     carrierDistanceMap,
   ]);
+  const carrierDisplayedPool = useMemo(() => {
+    const rows = [...carrierFilteredPool];
+    if (carrierSortMode === 'newest') {
+      rows.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return rows;
+    }
+    if (carrierSortMode === 'oldest') {
+      rows.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
+      return rows;
+    }
+    if (carrierSortMode === 'most_offers') {
+      rows.sort((a, b) => Number(b.offerCount || 0) - Number(a.offerCount || 0));
+      return rows;
+    }
+    if (carrierSortMode === 'nearest') {
+      rows.sort((a, b) => {
+        const aDist = typeof carrierDistanceMap[a._id] === 'number' ? carrierDistanceMap[a._id] : Number.POSITIVE_INFINITY;
+        const bDist = typeof carrierDistanceMap[b._id] === 'number' ? carrierDistanceMap[b._id] : Number.POSITIVE_INFINITY;
+        return aDist - bDist;
+      });
+      return rows;
+    }
+    if (carrierSortMode === 'farthest') {
+      rows.sort((a, b) => {
+        const aDist = typeof carrierDistanceMap[a._id] === 'number' ? carrierDistanceMap[a._id] : Number.NEGATIVE_INFINITY;
+        const bDist = typeof carrierDistanceMap[b._id] === 'number' ? carrierDistanceMap[b._id] : Number.NEGATIVE_INFINITY;
+        return bDist - aDist;
+      });
+      return rows;
+    }
+    return rows;
+  }, [carrierFilteredPool, carrierSortMode, carrierDistanceMap]);
   const quickLoadTypeOptions = useMemo(() => {
     const all = formOptions?.cargoTypes || [];
     if (!all.length) return [] as CargoTypeOption[];
@@ -589,6 +768,18 @@ export function AppPage() {
   const effectiveVehicleTypeSlug = useMemo(
     () => selectedVehicleTypeSlug || formOptions?.vehicleTypes?.[0]?.slug || '',
     [selectedVehicleTypeSlug, formOptions?.vehicleTypes],
+  );
+  const activeSubCategory = useMemo(
+    () => segmentConfig.subCategories.find((x) => x.id === subCategoryId) || null,
+    [segmentConfig, subCategoryId],
+  );
+  const selectedLoadTypeLabel = useMemo(
+    () => formOptions?.cargoTypes?.find((c) => c.slug === effectiveLoadTypeSlug)?.name || '-',
+    [formOptions?.cargoTypes, effectiveLoadTypeSlug],
+  );
+  const selectedVehicleTypeLabel = useMemo(
+    () => formOptions?.vehicleTypes?.find((v) => v.slug === effectiveVehicleTypeSlug)?.name || '-',
+    [formOptions?.vehicleTypes, effectiveVehicleTypeSlug],
   );
   const loadTypeLabelMap = useMemo(
     () =>
@@ -919,20 +1110,18 @@ export function AppPage() {
         setProfile(me);
         setCities(Array.isArray(cityRows) ? cityRows : []);
 
+        await refreshRegisterContractCompliance(me.role);
+
         if (me.role === 'carrier') {
-          const [feedRes, offersRes, jobsRes, vehiclesRes, alertsRes, loadTypeRes] = await Promise.all([
+          const [feedRes, offersRes, jobsRes, loadTypeRes] = await Promise.all([
             api.get<CarrierFeedShipment[]>('/shipments/feed'),
             api.get<CarrierOffer[]>('/offers/my/detailed'),
             api.get<CarrierJobsResponse>('/offers/carrier/jobs'),
-            api.get<CarrierVehicle[]>('/vehicles/my'),
-            api.get<CarrierLoadAlert[]>('/carrier-load-alerts/my'),
             api.get<LookupLoadType[]>('/lookups/load-types'),
           ]);
           setCarrierFeed(Array.isArray(feedRes.data) ? feedRes.data : []);
           setCarrierOffers(Array.isArray(offersRes.data) ? offersRes.data : []);
           setCarrierJobs(normalizeCarrierJobs(jobsRes.data));
-          setCarrierVehicles(Array.isArray(vehiclesRes.data) ? vehiclesRes.data : []);
-          setCarrierAlerts(Array.isArray(alertsRes.data) ? alertsRes.data : []);
           setCarrierLoadTypes(Array.isArray(loadTypeRes.data) ? loadTypeRes.data : []);
         }
       } catch (error: any) {
@@ -952,6 +1141,47 @@ export function AppPage() {
   }, [token, profile?.role, carrierTab]);
 
   useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    if (profile?.role !== 'carrier') return;
+    if (!carrierFeed.length) return;
+
+    const rows = carrierFeed.map((shipment: any, index) => {
+      const slugFromField = shipment?.loadTypeSlug || '';
+      const slugFromCargoType =
+        typeof shipment?.cargoTypeId === 'object'
+          ? (shipment?.cargoTypeId?.slug || '')
+          : '';
+      const parsedFromDescription = parseDescriptionLine(shipment?.description, 'Yük Tipi');
+      const resolvedSlug = slugFromField || slugFromCargoType || '';
+      const resolvedLabel =
+        (resolvedSlug && loadTypeLabelMap[resolvedSlug]) ||
+        (typeof shipment?.cargoTypeId === 'object' ? shipment?.cargoTypeId?.name : '') ||
+        parsedFromDescription ||
+        '';
+      return {
+        no: index + 1,
+        id: String(shipment?._id || ''),
+        title: String(shipment?.title || ''),
+        loadTypeSlug: resolvedSlug || '(yok)',
+        loadTypeLabel: resolvedLabel || '(yok)',
+        cargoTypeId:
+          typeof shipment?.cargoTypeId === 'string'
+            ? shipment.cargoTypeId
+            : (shipment?.cargoTypeId?._id || '(yok)'),
+        myOffer: shipment?.hasMyOffer ? 'Evet' : 'Hayır',
+        status: shipment?.status || '-',
+      };
+    });
+
+    console.groupCollapsed(`[Carrier Feed Debug] ${rows.length} ilan`);
+    console.table(rows);
+    carrierFeed.forEach((shipment: any, index) => {
+      console.log(`[Carrier Feed #${index + 1}]`, shipment);
+    });
+    console.groupEnd();
+  }, [profile?.role, carrierFeed, loadTypeLabelMap]);
+
+  useEffect(() => {
     if (profile?.role !== 'carrier') return;
     const validTabs = new Set(OFFER_TABS.map((tab) => tab.key));
     if (queryTab && validTabs.has(queryTab as (typeof OFFER_TABS)[number]['key'])) {
@@ -962,6 +1192,14 @@ export function AppPage() {
       setCarrierTab('active_jobs');
     }
   }, [profile?.role, queryTab, queryConversationId]);
+
+  useEffect(() => {
+    if (profile?.role !== 'carrier') return;
+    if (registerContractPending.length === 0) return;
+    if (carrierTab === 'pool' || carrierTab === 'nearby_map') {
+      setCarrierTab('active_jobs');
+    }
+  }, [profile?.role, registerContractPending.length, carrierTab]);
 
   const loadConversationMessages = async (conversationId: string) => {
     if (!conversationId) return;
@@ -1113,15 +1351,6 @@ export function AppPage() {
   }, [destinationCityId]);
 
   useEffect(() => {
-    if (!alertCityId) {
-      setAlertDistrict('');
-      return;
-    }
-    void loadDistricts(alertCityId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alertCityId]);
-
-  useEffect(() => {
     if (!carrierFilterCityId) {
       setCarrierFilterDistrict('');
       return;
@@ -1221,6 +1450,10 @@ export function AppPage() {
     const lines = [
       `Açıklama: ${description.trim() || '-'}`,
       `Yük Yapısı: ${loadScope}`,
+      `Gönderi Segmenti: ${segmentConfig.label}`,
+      `Segment Alt Kategori: ${activeSubCategory?.label || '-'}`,
+      `Yük Tipi: ${selectedLoadTypeLabel}`,
+      `Araç Tipi: ${selectedVehicleTypeLabel}`,
       `Çıkış Konumu: ${originAddress.trim() || '-'}`,
       `Varış Konumu: ${destinationAddress.trim() || '-'}`,
       `Çıkış Ekstra Tarifi: ${originExtraEnabled ? (originExtraNote.trim() || '-') : '-'}`,
@@ -1337,170 +1570,67 @@ export function AppPage() {
     setPreviewOpen(true);
   };
 
-  const getRecommendedVehicle = (shipment: CarrierFeedShipment) => {
-    const recommendedIds = (shipment.recommendedVehicleTypeIds || []).map((x) =>
-      typeof x === 'string' ? x : String(x?._id || ''),
-    );
-    const preferred = carrierVehicles.find((v) => {
-      if (v.status !== 'active') return false;
-      const typeId = String(v.vehicleTypeId?._id || '');
-      return recommendedIds.includes(typeId);
-    });
-    return preferred?._id || carrierVehicles.find((x) => x.status === 'active')?._id || '';
-  };
-
-  const ensureOfferDraft = (shipment: CarrierFeedShipment) => {
-    const found = offerDraft[shipment._id];
-    if (found) return found;
-    return { vehicleId: getRecommendedVehicle(shipment), amount: '', note: '' };
-  };
-
-  const setOfferField = (shipmentId: string, key: 'vehicleId' | 'amount' | 'note', value: string) => {
-    setOfferDraft((prev) => ({
-      ...prev,
-      [shipmentId]: {
-        ...(prev[shipmentId] || { vehicleId: '', amount: '', note: '' }),
-        [key]: value,
-      },
-    }));
-  };
-
-  const submitOffer = async (shipmentId: string) => {
-    const draft = offerDraft[shipmentId];
-    if (!draft?.vehicleId || !draft?.amount) {
-      setMessage('Teklif için araç ve tutar giriniz.');
-      notifyWarning('Teklif için araç ve tutar giriniz.');
-      return;
-    }
-
-    setOfferActionLoading(shipmentId);
-    setMessage('');
-    try {
-      await api.post('/offers', {
-        shipmentId,
-        vehicleId: draft.vehicleId,
-        amount: Number(draft.amount),
-        note: draft.note || undefined,
-      });
-      const [feedRes, offersRes] = await Promise.all([
-        api.get<CarrierFeedShipment[]>('/shipments/feed'),
-        api.get<CarrierOffer[]>('/offers/my/detailed'),
-      ]);
-      setCarrierFeed(Array.isArray(feedRes.data) ? feedRes.data : []);
-      setCarrierOffers(Array.isArray(offersRes.data) ? offersRes.data : []);
-      setCarrierTab('offered');
-      notifySuccess('Teklif başarıyla gönderildi.');
-    } catch (error: any) {
-      const errText = error?.response?.data?.message || 'Teklif verilemedi.';
-      setMessage(errText);
-      notifyError(errText);
-    } finally {
-      setOfferActionLoading('');
-    }
-  };
-
-  const resetAlertForm = () => {
-    setAlertEditId('');
-    setAlertName('');
-    setAlertMode('all');
-    setAlertCityId('');
-    setAlertDistrict('');
-    setAlertLoadTypeSlug('');
-  };
-
-  const startEditAlert = (alert: CarrierLoadAlert) => {
-    const matchedCityId =
-      cities.find(
-        (city) =>
-          (city.name || '').trim().toLocaleUpperCase('tr-TR') === (alert.city || '').trim().toLocaleUpperCase('tr-TR'),
-      )?.id || '';
-    setAlertEditId(alert._id);
-    setAlertName(alert.name || '');
-    setAlertMode(alert.transportMode || 'all');
-    setAlertCityId(matchedCityId);
-    setAlertDistrict(alert.district || '');
-    setAlertLoadTypeSlug(alert.loadTypeSlug || '');
-  };
-
-  const refreshCarrierAlerts = async () => {
-    const { data } = await api.get<CarrierLoadAlert[]>('/carrier-load-alerts/my');
-    setCarrierAlerts(Array.isArray(data) ? data : []);
-  };
-
-  const saveCarrierAlert = async () => {
-    if (!alertName.trim()) {
-      setMessage('Bildirim kuralı adı zorunlu.');
-      notifyWarning('Bildirim kuralı adı zorunlu.');
-      return;
-    }
-    setAlertActionLoading('save');
-    setMessage('');
-    try {
-      const payload = {
-        name: alertName.trim(),
-        transportMode: alertMode,
-        city: alertCityName || undefined,
-        district: alertDistrict || undefined,
-        loadTypeSlug: alertLoadTypeSlug || undefined,
-        isActive: true,
-      };
-      if (alertEditId) {
-        await api.patch(`/carrier-load-alerts/${alertEditId}`, payload);
-      } else {
-        await api.post('/carrier-load-alerts', payload);
-      }
-      await refreshCarrierAlerts();
-      resetAlertForm();
-      notifySuccess(alertEditId ? 'Bildirim kuralı güncellendi.' : 'Bildirim kuralı kaydedildi.');
-    } catch (error: any) {
-      const errText = error?.response?.data?.message || 'Bildirim kurali kaydedilemedi.';
-      setMessage(errText);
-      notifyError(errText);
-    } finally {
-      setAlertActionLoading('');
-    }
-  };
-
-  const toggleCarrierAlert = async (alert: CarrierLoadAlert) => {
-    setAlertActionLoading(alert._id);
-    setMessage('');
-    try {
-      await api.patch(`/carrier-load-alerts/${alert._id}`, { isActive: !alert.isActive });
-      await refreshCarrierAlerts();
-      notifySuccess(`Bildirim ${alert.isActive ? 'pasif' : 'aktif'} edildi.`);
-    } catch (error: any) {
-      const errText = error?.response?.data?.message || 'Bildirim durumu degistirilemedi.';
-      setMessage(errText);
-      notifyError(errText);
-    } finally {
-      setAlertActionLoading('');
-    }
-  };
-
-  const deleteCarrierAlert = async (alertId: string) => {
-    setAlertActionLoading(alertId);
-    setMessage('');
-    try {
-      await api.delete(`/carrier-load-alerts/${alertId}`);
-      await refreshCarrierAlerts();
-      if (alertEditId === alertId) resetAlertForm();
-      notifySuccess('Bildirim kuralı silindi.');
-    } catch (error: any) {
-      const errText = error?.response?.data?.message || 'Bildirim kurali silinemedi.';
-      setMessage(errText);
-      notifyError(errText);
-    } finally {
-      setAlertActionLoading('');
-    }
-  };
-
   const clearCarrierPoolFilters = () => {
     setCarrierFilterMode('all');
     setCarrierFilterCityId('');
     setCarrierFilterDistrict('');
     setCarrierNearbyLabel('');
     setCarrierNearbyCenter(null);
-    setCarrierRadiusKm(25);
+    setCarrierRadiusKm(50);
+  };
+
+  const CARRIER_NEARBY_CACHE_KEY = 'an_carrier_nearby_center';
+  const persistNearbyCenter = (center: { lat: number; lng: number }) => {
+    try {
+      localStorage.setItem(CARRIER_NEARBY_CACHE_KEY, JSON.stringify(center));
+    } catch {
+      // Ignore storage quota/private mode issues.
+    }
+  };
+
+  const refreshRegisterContractCompliance = async (role?: UserProfile['role']) => {
+    if (role !== 'shipper' && role !== 'carrier') {
+      setRegisterContractPending([]);
+      return;
+    }
+    setRegisterContractChecking(true);
+    try {
+      const { data } = await api.get<RegisterContractComplianceResponse>('/content/register-contracts/compliance');
+      const pendingContracts = Array.isArray(data?.pendingContracts) ? data.pendingContracts : [];
+      setRegisterContractPending(pendingContracts);
+    } catch {
+      setRegisterContractPending([]);
+    } finally {
+      setRegisterContractChecking(false);
+    }
+  };
+
+  const handleResolveRegisterContracts = async () => {
+    if (!registerContractPending.length) return;
+    const acceptedSlugs = await askUpdatedRegisterContractsConsent(registerContractPending);
+    if (!acceptedSlugs || acceptedSlugs.length === 0) return;
+    setRegisterContractSaving(true);
+    try {
+      await api.post('/content/register-contracts/accept-updates', { slugs: acceptedSlugs });
+      await refreshRegisterContractCompliance(profile?.role);
+      notifySuccess('Güncellenen sözleşmeler onaylandı.');
+    } catch (error: any) {
+      const errText = error?.response?.data?.message || 'Sözleşme onayı kaydedilemedi.';
+      notifyError(errText);
+    } finally {
+      setRegisterContractSaving(false);
+    }
+  };
+  const readNearbyCenterFromCache = () => {
+    try {
+      const raw = localStorage.getItem(CARRIER_NEARBY_CACHE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as { lat?: number; lng?: number };
+      if (!Number.isFinite(parsed?.lat) || !Number.isFinite(parsed?.lng)) return null;
+      return { lat: Number(parsed.lat), lng: Number(parsed.lng) };
+    } catch {
+      return null;
+    }
   };
 
   const refreshCarrierJobs = async (silent = false) => {
@@ -1517,25 +1647,72 @@ export function AppPage() {
     }
   };
 
-  const applyNearbyCarrierFilter = () => {
+  const applyNearbyCarrierFilter = (options?: { forceRadiusKm?: number }) => {
+    const openNearbyFallbackChoices = async (reasonText: string) => {
+      const result = await Swal.fire({
+        icon: 'warning',
+        title: 'Konum alınamadı',
+        text: reasonText,
+        confirmButtonText: 'Tekrar Dene',
+        showDenyButton: true,
+        denyButtonText: 'İl / İlçe ile Devam Et',
+        showCancelButton: true,
+        cancelButtonText: 'Konumsuz Devam Et',
+        allowOutsideClick: false,
+      });
+
+      if (result.isConfirmed) {
+        applyNearbyCarrierFilter(options);
+        return;
+      }
+
+      if (result.isDenied) {
+        setCarrierNearbyCenter(null);
+        setCarrierNearbyLabel('');
+        setMessage('Konum alınamadı. İl / ilçe filtrelerini kullanarak devam edebilirsiniz.');
+        const citySelect = document.getElementById('carrier-filter-city') as HTMLSelectElement | null;
+        citySelect?.focus();
+        return;
+      }
+
+      setCarrierNearbyCenter(null);
+      setCarrierNearbyLabel('');
+      setMessage('Konum alınamadı. Konumsuz şekilde tüm ilanlar gösteriliyor.');
+    };
+
+    if (typeof options?.forceRadiusKm === 'number' && options.forceRadiusKm > 0) {
+      setCarrierRadiusKm(options.forceRadiusKm);
+    }
     if (!navigator.geolocation) {
-      setMessage('Tarayıcı konum desteği bulunamadı.');
-      notifyWarning('Tarayıcı konum desteği bulunamadı.');
+      void openNearbyFallbackChoices('Tarayıcı konum desteği bulunamadı.');
       return;
     }
     setCarrierNearbyLoading(true);
     setMessage('');
+    void Swal.fire({
+      title: 'Konum bilgileri alınıyor',
+      text: 'Lütfen bekleyin...',
+      allowOutsideClick: false,
+      allowEscapeKey: false,
+      showConfirmButton: false,
+      didOpen: () => {
+        Swal.showLoading();
+      },
+    });
     navigator.geolocation.getCurrentPosition(
       (pos) => {
         // Net davranış: Yakınımdakiler filtresi sadece radius + pickupGeo bazlı çalışır.
         // İl/ilçe filtreleri otomatik set edilmez, varsa temizlenir.
         setCarrierFilterCityId('');
         setCarrierFilterDistrict('');
-        setCarrierNearbyCenter({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        const currentCenter = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setCarrierNearbyCenter(currentCenter);
+        persistNearbyCenter(currentCenter);
         const googleObj = (window as any).google;
         const geocoder = googleObj?.maps ? new googleObj.maps.Geocoder() : null;
         if (!geocoder) {
           setCarrierNearbyLoading(false);
+          if (Swal.isVisible()) Swal.close();
           setCarrierNearbyLabel(`Mevcut konum (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`);
           return;
         }
@@ -1543,6 +1720,7 @@ export function AppPage() {
           { location: { lat: pos.coords.latitude, lng: pos.coords.longitude }, language: 'tr', region: 'TR' },
           async (results: any[], status: any) => {
             setCarrierNearbyLoading(false);
+            if (Swal.isVisible()) Swal.close();
             const ok = status === googleObj.maps.GeocoderStatus.OK && Array.isArray(results) && results.length > 0;
             if (!ok) {
               setCarrierNearbyLabel(`Mevcut konum (${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)})`);
@@ -1563,13 +1741,37 @@ export function AppPage() {
       },
       (err) => {
         setCarrierNearbyLoading(false);
-        const errText = err?.message || 'Konum alınamadı.';
+        if (Swal.isVisible()) Swal.close();
+        const code = Number(err?.code || 0);
+        const isTimeout = code === 3 || /timeout expired/i.test(String(err?.message || ''));
+        const fallbackCenter = readNearbyCenterFromCache();
+        if (isTimeout && fallbackCenter) {
+          setCarrierFilterCityId('');
+          setCarrierFilterDistrict('');
+          setCarrierNearbyCenter(fallbackCenter);
+          setCarrierNearbyLabel(`Son bilinen konum (${fallbackCenter.lat.toFixed(4)}, ${fallbackCenter.lng.toFixed(4)})`);
+          const warnText = 'Canlı konum zaman aşımına uğradı, son bilinen konum kullanıldı.';
+          setMessage(warnText);
+          notifyWarning(warnText);
+          return;
+        }
+        const errText = isTimeout
+          ? 'Konum isteği zaman aşımına uğradı. Nasıl devam etmek istersiniz?'
+          : err?.message || 'Konum alınamadı. Nasıl devam etmek istersiniz?';
         setMessage(errText);
-        notifyError(errText);
+        void openNearbyFallbackChoices(errText);
       },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 300000 },
     );
   };
+
+  useEffect(() => {
+    if (loading) return;
+    if (profile?.role !== 'carrier') return;
+    if (carrierAutoNearbyAppliedRef.current) return;
+    carrierAutoNearbyAppliedRef.current = true;
+    applyNearbyCarrierFilter({ forceRadiusKm: 50 });
+  }, [loading, profile?.role]);
 
   if (loading) {
     return (
@@ -1600,10 +1802,50 @@ export function AppPage() {
   }
 
   if (profile?.role === 'carrier') {
+    const isCarrierPoolLockedByContract = registerContractPending.length > 0;
+    const carrierVisibleTabs = isCarrierPoolLockedByContract
+      ? OFFER_TABS.filter((tab) => tab.key !== 'pool' && tab.key !== 'nearby_map')
+      : OFFER_TABS;
     return (
       <section className="container py-5">
         <h1 className="shipment-page-title mb-4">Taşıyıcı Yük Alanı</h1>
         {message ? <div className="alert alert-warning">{message}</div> : null}
+        {registerContractPending.length > 0 ? (
+          <div className="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div>
+              <strong>Güncel sözleşme onayı gerekli.</strong>
+              <div className="small">
+                {registerContractPending.length} sözleşme güncellendi. Yük işlemlerine devam etmek için onaylayın.
+              </div>
+            </div>
+            <div className="d-flex gap-2">
+              <button
+                type="button"
+                className="btn btn-sm btn-warning"
+                disabled={registerContractSaving}
+                onClick={() => void handleResolveRegisterContracts()}
+              >
+                {registerContractSaving ? 'Kaydediliyor...' : 'Sözleşmeleri Onayla'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-sm btn-outline-secondary"
+                disabled={registerContractChecking}
+                onClick={() => void refreshRegisterContractCompliance(profile?.role)}
+              >
+                {registerContractChecking ? 'Kontrol ediliyor...' : 'Yenile'}
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {isCarrierPoolLockedByContract ? (
+          <div className="panel-card p-3 mb-3 border border-warning-subtle">
+            <div className="small text-secondary">
+              <i className="bi bi-lock me-1"></i>
+              Güncel sözleşme onayı tamamlanana kadar Yük Havuzu ve Haritada Göster sekmeleri gizlenir.
+            </div>
+          </div>
+        ) : null}
 
         {chatConversationId ? (
           <div className="panel-card p-4 mb-3">
@@ -1664,7 +1906,7 @@ export function AppPage() {
         ) : null}
 
         <div className="d-flex flex-wrap gap-2 mb-3">
-          {OFFER_TABS.map((tab) => (
+          {carrierVisibleTabs.map((tab) => (
             <button
               key={tab.key}
               type="button"
@@ -1676,10 +1918,24 @@ export function AppPage() {
           ))}
         </div>
 
-        {carrierTab === 'pool' ? (
+        {carrierTab === 'pool' && !isCarrierPoolLockedByContract ? (
           <div className="panel-card p-4">
-            <h4 className="fw-bold mb-3">Yük Havuzu ({carrierFilteredPool.length})</h4>
-            <div className="row g-2 align-items-end mb-3">
+            <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+              <h4 className="fw-bold mb-0">Yük Havuzu ({carrierDisplayedPool.length})</h4>
+              {!carrierFiltersOpen ? (
+                <button
+                  type="button"
+                  className="btn btn-outline-primary btn-sm"
+                  onClick={() => setCarrierFiltersOpen(true)}
+                  aria-expanded={carrierFiltersOpen}
+                  title="Filtreleri Göster"
+                >
+                  <i className="bi bi-funnel"></i>
+                </button>
+              ) : null}
+            </div>
+            {carrierFiltersOpen ? (
+              <div className="row g-2 align-items-end mb-3">
               <div className="col-md-3">
                 <label className="form-label fw-semibold">Taşıma Modu</label>
                 <select
@@ -1695,6 +1951,7 @@ export function AppPage() {
               <div className="col-md-2">
                 <label className="form-label fw-semibold">İl</label>
                 <select
+                  id="carrier-filter-city"
                   className="form-select shipment-input"
                   value={carrierFilterCityId}
                   onChange={(e) => setCarrierFilterCityId(e.target.value)}
@@ -1738,7 +1995,7 @@ export function AppPage() {
                 <button
                   type="button"
                   className="btn btn-outline-success flex-fill"
-                  onClick={applyNearbyCarrierFilter}
+                  onClick={() => applyNearbyCarrierFilter()}
                   disabled={carrierNearbyLoading}
                 >
                   <i className="bi bi-geo-alt me-1"></i>
@@ -1747,89 +2004,243 @@ export function AppPage() {
                 <button type="button" className="btn btn-outline-secondary" onClick={clearCarrierPoolFilters}>
                   Temizle
                 </button>
+                <button
+                  type="button"
+                  className="btn btn-outline-primary"
+                  onClick={() => setCarrierFiltersOpen((prev) => !prev)}
+                  aria-expanded={carrierFiltersOpen}
+                  title={carrierFiltersOpen ? 'Filtreleri Gizle' : 'Filtreleri Göster'}
+                >
+                  <i className={`bi ${carrierFiltersOpen ? 'bi-funnel-fill' : 'bi-funnel'}`}></i>
+                </button>
               </div>
-            </div>
-            {carrierNearbyLabel ? (
-              <div className="small text-secondary mb-3">
-                <i className="bi bi-pin-map me-1"></i>
-                Yakın filtre aktif: <strong>{carrierNearbyLabel}</strong> · Yarıçap: <strong>{carrierRadiusKm} km</strong>
               </div>
             ) : null}
-            {carrierFilteredPool.length === 0 ? (
+            <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+              <div className="small text-secondary">
+                <i className="bi bi-pin-map me-1"></i>
+                {carrierNearbyLabel ? (
+                  <>
+                    Yakın filtre aktif: <strong>{carrierNearbyLabel}</strong> · Yarıçap: <strong>{carrierRadiusKm} km</strong>
+                  </>
+                ) : (
+                  <>Yakın filtre aktif değil</>
+                )}
+              </div>
+              <select
+                className="form-select form-select-sm shipment-input"
+                value={carrierSortMode}
+                onChange={(e) =>
+                  setCarrierSortMode(
+                    e.target.value as 'newest' | 'oldest' | 'nearest' | 'farthest' | 'most_offers',
+                  )
+                }
+                style={{ minWidth: 220, maxWidth: 280 }}
+              >
+                <option value="newest">Sıralama: En Yeni</option>
+                <option value="oldest">Sıralama: En Eski</option>
+                <option value="nearest">Sıralama: En Yakın</option>
+                <option value="farthest">Sıralama: En Uzak</option>
+                <option value="most_offers">Sıralama: En Çok Teklif</option>
+              </select>
+            </div>
+            {carrierDisplayedPool.length === 0 ? (
               <div className="text-secondary">Teklif verilebilecek yeni yük bulunmuyor.</div>
             ) : (
-              <div className="d-grid gap-3">
-                {carrierFilteredPool.map((shipment) => {
-                  const draft = ensureOfferDraft(shipment);
+              <div className="carrier-pool-premium-grid">
+                {carrierDisplayedPool.map((shipment) => {
+                  const loadAttributesFromDescription = parseDescriptionLine(shipment.description, 'Yük Niteliği');
+                  const topMetaText =
+                    loadAttributesFromDescription && loadAttributesFromDescription.trim() !== '-'
+                      ? loadAttributesFromDescription
+                      : 'Teklife açık ilan';
+                  const isTopMetaFallback = topMetaText === 'Teklife açık ilan';
+                  const loadMetric =
+                    typeof shipment.estimatedWeightKg === 'number' && shipment.estimatedWeightKg > 0
+                      ? `${shipment.estimatedWeightKg} kg`
+                      : typeof shipment.estimatedVolumeM3 === 'number' && shipment.estimatedVolumeM3 > 0
+                        ? `${shipment.estimatedVolumeM3} m3`
+                        : typeof shipment.pieceCount === 'number' && shipment.pieceCount > 0
+                          ? `${shipment.pieceCount} adet`
+                          : '-';
+                  const metaMode = MODE_LABEL[shipment.transportMode] || 'Standart';
+                  const loadTypeSlugFromPayload =
+                    shipment.loadTypeSlug ||
+                    (typeof shipment.cargoTypeId === 'object' ? (shipment.cargoTypeId?.slug || '') : '');
+                  const loadTypeNameFromPayload =
+                    typeof shipment.cargoTypeId === 'object' ? (shipment.cargoTypeId?.name || '') : '';
+                  const loadTypeFromDescription = parseDescriptionLine(shipment.description, 'Yük Tipi');
+                  const loadTypeText =
+                    (loadTypeSlugFromPayload && (loadTypeLabelMap[loadTypeSlugFromPayload] || loadTypeSlugFromPayload)) ||
+                    loadTypeNameFromPayload ||
+                    loadTypeFromDescription ||
+                    'Belirtilmemiş';
+                  const recommendedVehicleTypeTextFromDescription = parseDescriptionLine(shipment.description, 'Araç Tipi');
+                  const recommendedVehicleCount = Array.isArray(shipment.recommendedVehicleTypeIds)
+                    ? shipment.recommendedVehicleTypeIds.length
+                    : 0;
+                  const recommendedVehicleText =
+                    recommendedVehicleTypeTextFromDescription ||
+                    (recommendedVehicleCount > 0 ? `${recommendedVehicleCount} uygun araç tipi` : 'Belirtilmemiş');
+                  const totalOfferCount =
+                    typeof shipment.offerCount === 'number'
+                      ? shipment.offerCount
+                      : shipment.status === 'offer_collecting'
+                        ? 1
+                        : 0;
+                  const budgetFromDescription = parseDescriptionLine(shipment.description, 'Bütçe Aralığı');
+                  const pickupDistanceKm =
+                    carrierNearbyCenter && typeof carrierDistanceMap[shipment._id] === 'number'
+                      ? carrierDistanceMap[shipment._id]
+                      : null;
+                  const budgetText =
+                    budgetFromDescription && budgetFromDescription.trim() && budgetFromDescription.trim() !== '-'
+                      ? budgetFromDescription.trim()
+                      : '';
+                  const budgetParts = budgetText
+                    ? budgetText
+                        .split('-')
+                        .map((part) => part.trim())
+                        .filter(Boolean)
+                    : [];
+                  const formatBudgetPart = (raw: string) => {
+                    const cleaned = raw.replace(/[^\d.,]/g, '').replace(/\./g, '').replace(',', '.');
+                    const num = Number(cleaned);
+                    if (Number.isFinite(num) && num > 0) {
+                      return Math.round(num).toLocaleString('tr-TR');
+                    }
+                    return raw.replace(/[^\d.,-]/g, '').trim() || raw;
+                  };
+                  const budgetSummary =
+                    budgetParts.length >= 2
+                      ? `${formatBudgetPart(budgetParts[0])} - ${formatBudgetPart(budgetParts[1])}`
+                      : budgetText
+                        ? formatBudgetPart(budgetText)
+                        : 'Bütçe girilmedi';
+                  const distanceText = typeof pickupDistanceKm === 'number'
+                    ? `Yükleme noktasına ${pickupDistanceKm.toFixed(1)} km`
+                    : 'Yükleme noktasına uzaklık hesaplanamadı';
+                  const pickupLabel = `${shipment.pickupCity || '-'} / ${shipment.pickupDistrict || '-'}`;
+                  const dropoffLabel = `${shipment.dropoffCity || '-'} / ${shipment.dropoffDistrict || '-'}`;
+                  const durationLabel =
+                    typeof shipment.routeDurationMin === 'number'
+                      ? `${Math.floor(shipment.routeDurationMin / 60)}s ${shipment.routeDurationMin % 60}dk`
+                      : 'Süre hesaplanıyor';
                   return (
-                    <div key={shipment._id} className="border rounded-3 p-3">
-                      <div className="d-flex justify-content-between align-items-start gap-2 mb-2">
-                        <div>
-                          <Link to={`/hesabim/yuk/${shipment._id}`} className="fw-bold text-decoration-none">
-                            {shipment.title}
-                          </Link>
-                          <div className="small text-secondary">
-                            {MODE_LABEL[shipment.transportMode]} · {shipment.pickupCity || '-'} / {shipment.pickupDistrict || '-'} › {shipment.dropoffCity || '-'} / {shipment.dropoffDistrict || '-'}
+                    <article key={shipment._id} className="carrier-pool-premium-card">
+                      <div className="carrier-pool-premium-top">
+                        <div className="carrier-pool-premium-top-left">
+                          <i className="bi bi-stars"></i>
+                          <div>
+                            <strong>{shipment.title}</strong>
+                            <p className={`carrier-pool-premium-top-submeta ${isTopMetaFallback ? 'is-fallback' : ''}`}>
+                              {topMetaText}
+                            </p>
                           </div>
                         </div>
-                        <div className="d-flex flex-column align-items-end gap-1">
-                          <span className="badge text-bg-light">{MODE_LABEL[shipment.transportMode]}</span>
-                          {carrierNearbyCenter && typeof carrierDistanceMap[shipment._id] === 'number' ? (
-                            <span className="badge text-bg-success-subtle border border-success-subtle text-success-emphasis">
-                              {carrierDistanceMap[shipment._id].toFixed(1)} km
-                            </span>
-                          ) : null}
-                        </div>
-                      </div>
-
-                      <div className="row g-2">
-                        <div className="col-md-4">
-                          <select
-                            className="form-select shipment-input"
-                            value={draft.vehicleId}
-                            onChange={(e) => setOfferField(shipment._id, 'vehicleId', e.target.value)}
-                          >
-                            <option value="">Araç seçin</option>
-                            {carrierVehicles.filter((x) => x.status === 'active').map((vehicle) => (
-                              <option key={vehicle._id} value={vehicle._id}>
-                                {(vehicle.plateMasked || '-')} · {vehicle.vehicleTypeId?.name || 'Araç'}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <div className="col-md-3">
-                          <input
-                            className="form-control shipment-input"
-                            placeholder="Teklif (?)"
-                            value={draft.amount}
-                            onChange={(e) => setOfferField(shipment._id, 'amount', e.target.value)}
-                          />
-                        </div>
-                        <div className="col-md-3">
-                          <input
-                            className="form-control shipment-input"
-                            placeholder="Not (opsiyonel)"
-                            value={draft.note}
-                            onChange={(e) => setOfferField(shipment._id, 'note', e.target.value)}
-                          />
-                        </div>
-                        <div className="col-md-2">
+                        <div className="carrier-pool-premium-top-side">
+                          <span className="carrier-pool-budget-note">
+                            <span className="carrier-pool-budget-note-label">Bütçe Beklentisi</span>
+                            <span className="carrier-pool-budget-note-value">{budgetSummary}</span>
+                          </span>
                           <button
                             type="button"
-                            className="btn btn-primary w-100"
-                            disabled={offerActionLoading === shipment._id}
-                            onClick={() => submitOffer(shipment._id)}
+                            className="carrier-pool-report-btn"
+                            title="Bu ilanı şikayet et"
+                            onClick={() => void openShipmentComplaintModal(shipment)}
                           >
-                            {offerActionLoading === shipment._id ? '...' : 'Teklif Ver'}
+                            <i className="bi bi-info-circle carrier-pool-premium-top-info"></i>
                           </button>
                         </div>
                       </div>
-                    </div>
+
+                      <div className="carrier-pool-premium-main">
+                        <div className="carrier-pool-premium-main-left">
+                          <div className="carrier-pool-premium-route-core">
+                            <div className="carrier-pool-premium-center-meta">
+                              <span className="carrier-pool-premium-center-chip">
+                                <span className="carrier-pool-premium-center-meta-icon">
+                                  <i className="bi bi-truck"></i>
+                                </span>
+                                <span className="carrier-pool-premium-center-meta-text">
+                                  Uygun Araçlar: {recommendedVehicleText}
+                                </span>
+                              </span>
+                              {loadTypeText !== 'Belirtilmemiş' ? (
+                                <span className="carrier-pool-premium-center-chip is-load-type">
+                                  <span className="carrier-pool-premium-center-meta-icon">
+                                    <i className="bi bi-box-seam"></i>
+                                  </span>
+                                  <span className="carrier-pool-premium-center-meta-text">
+                                    Yük Tipi: {loadTypeText}
+                                  </span>
+                                </span>
+                              ) : null}
+                            </div>
+                            <div className="carrier-pool-premium-times">
+                              <div className="carrier-pool-premium-pickup-stack">
+                                <span className="carrier-pool-premium-brand-dot">
+                                  <i className="bi bi-geo-alt-fill"></i>
+                                </span>
+                                <div className="carrier-pool-premium-point-block">
+                                  <strong>{pickupLabel}</strong>
+                                  <span className="carrier-pool-point-label is-pickup">
+                                    <span className="carrier-pool-point-glyph">
+                                      <i className="bi bi-box-seam"></i>
+                                    </span>
+                                    <span className="carrier-pool-point-text">Yükleme Noktası</span>
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="carrier-pool-premium-journey">
+                                <span>{durationLabel}</span>
+                                <div className="carrier-pool-premium-line">
+                                  <i className="bi bi-caret-right-fill"></i>
+                                </div>
+                                <em>{metaMode}</em>
+                                <small className="carrier-pool-premium-journey-note">
+                                  <i className="bi bi-geo-alt"></i>
+                                  <span>{distanceText}</span>
+                                </small>
+                              </div>
+                              <div>
+                                <strong>{dropoffLabel}</strong>
+                                <span className="carrier-pool-point-label is-dropoff">
+                                  <span className="carrier-pool-point-glyph">
+                                    <i className="bi bi-pin-map-fill"></i>
+                                  </span>
+                                  <span className="carrier-pool-point-text">Teslimat Noktası</span>
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="carrier-pool-premium-main-right">
+                          <div className="carrier-pool-offer-count-pill">
+                            <i className="bi bi-chat-left-text"></i>
+                            <span>{totalOfferCount} teklif</span>
+                          </div>
+                          <strong className="carrier-pool-load-metric">{loadMetric !== '-' ? loadMetric : 'Yük bilgisi yok'}</strong>
+                          <Link to={`/hesabim/yuk/${shipment._id}`} className="carrier-pool-premium-cta carrier-pool-cta-modern">
+                            Teklif Ver
+                            <i className="bi bi-arrow-right ms-2"></i>
+                          </Link>
+                        </div>
+                      </div>
+                    </article>
                   );
                 })}
               </div>
             )}
           </div>
+        ) : null}
+
+        {carrierTab === 'nearby_map' && !isCarrierPoolLockedByContract ? (
+          <NearbyLoadsMapPanel
+            loads={carrierPool}
+            onOpenDetail={(shipmentId) => navigate(`/hesabim/yuk/${shipmentId}`)}
+          />
         ) : null}
 
         {carrierTab === 'active_jobs' ? (
@@ -1879,7 +2290,7 @@ export function AppPage() {
                         <td>
                           {(job.vehicle?.plateMasked || '-')} {job.vehicle?.brand || ''} {job.vehicle?.model || ''}
                         </td>
-                        <td>{typeof job.price === 'number' ? `?${job.price}` : '-'}</td>
+                        <td>{formatTryCurrency(job.price)}</td>
                         <td>{formatDate(job.acceptedAt)}</td>
                         <td>
                           <span className={`shipment-status-pill ${job.jobBucket === 'active' ? 'tone-success' : 'tone-info'}`}>
@@ -1897,31 +2308,48 @@ export function AppPage() {
 
         {carrierTab === 'offered' ? (
           <div className="panel-card p-4">
-            <h4 className="fw-bold mb-3">Teklif Verdiklerim ({carrierOffered.length})</h4>
+            <div className="d-flex justify-content-between align-items-center mb-3">
+              <div>
+                <h4 className="fw-bold mb-1">Teklif Verdiğim İlanlar</h4>
+                <p className="text-secondary mb-0">İlan bazlı görünüm: teklif verdiğin yüklerin güncel durumu.</p>
+              </div>
+              <span className="badge text-bg-light fs-6">{carrierOffered.length} kayıt</span>
+            </div>
             {carrierOffered.length === 0 ? (
               <div className="text-secondary">Henüz teklif verdiğiniz yük yok.</div>
             ) : (
-              <div className="table-responsive">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Yük</th>
-                      <th>Rota</th>
-                      <th>Durum</th>
-                      <th>Teklifim</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {carrierOffered.map((item) => (
-                      <tr key={item._id}>
-                        <td><Link to={`/hesabim/yuk/${item._id}`} className="text-decoration-none">{item.title}</Link></td>
-                        <td>{item.pickupCity || '-'} › {item.dropoffCity || '-'}</td>
-                        <td>{item.myOfferStatus || '-'}</td>
-                        <td>{typeof item.myOfferPrice === 'number' ? `?${item.myOfferPrice}` : '-'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="carrier-offers-premium-list">
+                {carrierOffered.map((item) => (
+                  <article key={item._id} className="carrier-offers-premium-card">
+                    <div className="carrier-offers-premium-main">
+                      <div className="carrier-offers-premium-top">
+                        <div>
+                          <strong className="carrier-offers-premium-title">{item.title || '-'}</strong>
+                          <div className="carrier-offers-premium-route">
+                            {`${item.pickupCity || '-'} / ${item.dropoffCity || '-'}`}
+                          </div>
+                        </div>
+                        <span className={`shipment-status-pill ${offerStatusPillTone(item.myOfferStatus)}`}>
+                          {offerStatusLabel(item.myOfferStatus)}
+                        </span>
+                      </div>
+                      <div className="carrier-offers-premium-meta">
+                        <span>
+                          <i className="bi bi-truck" /> {item.transportMode === 'intercity' ? 'Şehirler Arası' : 'Şehir İçi'}
+                        </span>
+                        <span>
+                          <i className="bi bi-calendar3" /> {item.createdAt ? new Date(item.createdAt).toLocaleDateString('tr-TR') : '-'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="carrier-offers-premium-right">
+                      <strong className="carrier-offers-price">{formatTryCurrency(item.myOfferPrice)}</strong>
+                      <Link to={`/hesabim/yuk/${item._id}`} className="btn btn-sm btn-outline-primary">
+                        İlan Detayı
+                      </Link>
+                    </div>
+                  </article>
+                ))}
               </div>
             )}
           </div>
@@ -1929,278 +2357,152 @@ export function AppPage() {
 
         {carrierTab === 'offers' ? (
           <div className="panel-card p-4">
-            <h4 className="fw-bold mb-3">Tekliflerim ({carrierOffers.length})</h4>
+            <div className="d-flex justify-content-between align-items-center mb-3">
+              <div>
+                <h4 className="fw-bold mb-1">Teklif Kayıtlarım</h4>
+                <p className="text-secondary mb-0">Teklif bazlı görünüm: araç, fiyat, durum ve tarih detayları.</p>
+              </div>
+              <span className="badge text-bg-light fs-6">{carrierOffers.length} kayıt</span>
+            </div>
             {carrierOffers.length === 0 ? (
               <div className="text-secondary">Henüz teklif kaydı bulunmuyor.</div>
             ) : (
-              <div className="table-responsive">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Yük</th>
-                      <th>Araç</th>
-                      <th>Tutar</th>
-                      <th>Durum</th>
-                      <th>Tarih</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {carrierOffers.map((offer) => (
-                      <tr key={offer._id}>
-                        <td>
-                          {offer.shipmentId?._id ? (
-                            <Link to={`/hesabim/yuk/${offer.shipmentId._id}`} className="text-decoration-none">
-                              {offer.shipmentId?.title || '-'}
-                            </Link>
-                          ) : '-'}
-                        </td>
-                        <td>{offer.vehicleId?.plateMasked || '-'} {offer.vehicleId?.brand || ''}</td>
-                        <td>{typeof offer.price === 'number' ? `?${offer.price}` : '-'}</td>
-                        <td>{offer.status}</td>
-                        <td>{formatDate(offer.createdAt)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="carrier-offers-premium-list">
+                {carrierOffers.map((offer) => (
+                  <article key={offer._id} className="carrier-offers-premium-card">
+                    <div className="carrier-offers-premium-main">
+                      <div className="carrier-offers-premium-top">
+                        <div>
+                          <strong className="carrier-offers-premium-title">{offer.shipmentId?.title || '-'}</strong>
+                          <div className="carrier-offers-premium-route">
+                            {`${offer.shipmentId?.pickupCity || '-'} / ${offer.shipmentId?.dropoffCity || '-'}`}
+                          </div>
+                        </div>
+                        <span className={`shipment-status-pill ${offerStatusPillTone(offer.status)}`}>
+                          {offerStatusLabel(offer.status)}
+                        </span>
+                      </div>
+                      <div className="carrier-offers-premium-meta">
+                        <span>
+                          <i className="bi bi-truck" /> {offer.vehicleId?.plateMasked || '-'} {offer.vehicleId?.brand || ''}
+                        </span>
+                        <span>
+                          <i className="bi bi-calendar3" /> {formatDate(offer.createdAt)}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="carrier-offers-premium-right">
+                      <strong className="carrier-offers-price">{formatTryCurrency(offer.price)}</strong>
+                      {offer.shipmentId?._id ? (
+                        <Link to={`/hesabim/yuk/${offer.shipmentId._id}`} className="btn btn-sm btn-outline-primary">
+                          İlan Detayı
+                        </Link>
+                      ) : null}
+                    </div>
+                  </article>
+                ))}
               </div>
             )}
           </div>
         ) : null}
 
-        {carrierTab === 'alerts' ? (
-          <div className="d-grid gap-3">
-            <div className="panel-card p-4 carrier-alert-form-card">
-              <div className="carrier-alert-form-head d-flex justify-content-between align-items-start mb-3">
-                <div>
-                  <h4 className="fw-bold mb-1">
-                    <i className="bi bi-bell-fill me-2 text-primary"></i>
-                    {alertEditId ? 'Bildirim Kuralını Düzenle' : 'Yeni Bildirim Kuralı'}
-                  </h4>
-                  <p className="text-secondary mb-0">
-                    Yeni bir yük yayınlandığında sana hangi kriterlerde bildirim gelsin belirle.
-                  </p>
-                </div>
-                {alertEditId ? (
-                  <button type="button" className="btn btn-outline-secondary btn-sm" onClick={resetAlertForm}>
-                    Düzenlemeyi İptal Et
-                  </button>
-                ) : null}
-              </div>
-
-              <div className="row g-3">
-                <div className="col-md-4">
-                  <label className="form-label fw-semibold">Kural Adı</label>
-                  <input
-                    className="form-control shipment-input carrier-alert-input"
-                    placeholder="Örn: İstanbul içi soğuk zincir"
-                    value={alertName}
-                    onChange={(e) => setAlertName(e.target.value)}
-                  />
-                  <small className="text-secondary">Kurala kısa ve ayırt edici bir isim ver.</small>
-                </div>
-                <div className="col-md-2">
-                  <label className="form-label fw-semibold">Taşıma Modu</label>
-                  <select className="form-select shipment-input carrier-alert-input" value={alertMode} onChange={(e) => setAlertMode(e.target.value as 'all' | 'intracity' | 'intercity')}>
-                    <option value="all">Tümü</option>
-                    <option value="intracity">Şehir İçi</option>
-                    <option value="intercity">Şehirler Arası</option>
-                  </select>
-                </div>
-                <div className="col-md-2">
-                  <label className="form-label fw-semibold">İl</label>
-                  <select className="form-select shipment-input carrier-alert-input" value={alertCityId} onChange={(e) => setAlertCityId(e.target.value)}>
-                    <option value="">Tüm İller</option>
-                    {cities.map((city) => <option key={city.id} value={city.id}>{city.name}</option>)}
-                  </select>
-                </div>
-                <div className="col-md-2">
-                  <label className="form-label fw-semibold">İlçe</label>
-                  <select
-                    className="form-select shipment-input carrier-alert-input"
-                    value={alertDistrict}
-                    onChange={(e) => setAlertDistrict(e.target.value)}
-                    disabled={!alertCityId}
-                  >
-                    <option value="">Tüm İlçeler</option>
-                    {alertDistricts.map((district) => <option key={district.id} value={district.name}>{district.name}</option>)}
-                  </select>
-                </div>
-                <div className="col-md-2">
-                  <label className="form-label fw-semibold">Yük Tipi</label>
-                  <select
-                    className="form-select shipment-input carrier-alert-input"
-                    value={alertLoadTypeSlug}
-                    onChange={(e) => setAlertLoadTypeSlug(e.target.value)}
-                  >
-                    <option value="">Tüm Yük Tipleri</option>
-                    {carrierLoadTypes.map((loadType) => (
-                      <option key={loadType.key} value={loadType.key}>
-                        {loadType.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              <div className="carrier-alert-preview mt-3">
-                <span className="carrier-alert-preview-label">Önizleme:</span>
-                <span className="badge text-bg-light">Mod: {alertMode === 'all' ? 'Tümü' : MODE_LABEL[alertMode]}</span>
-                <span className="badge text-bg-light">İl: {alertCityName || 'Tüm İller'}</span>
-                <span className="badge text-bg-light">İlçe: {alertDistrict || 'Tüm İlçeler'}</span>
-                <span className="badge text-bg-light">
-                  Yük: {alertLoadTypeSlug ? (loadTypeLabelMap[alertLoadTypeSlug] || alertLoadTypeSlug) : 'Tüm Yük Tipleri'}
-                </span>
-              </div>
-
-              <div className="carrier-alert-form-actions mt-3 d-flex gap-2">
-                <button
-                  type="button"
-                  className="btn btn-primary px-4"
-                  disabled={alertActionLoading === 'save'}
-                  onClick={saveCarrierAlert}
-                >
-                  {alertActionLoading === 'save' ? 'Kaydediliyor...' : alertEditId ? 'Güncelle' : 'Kuralı Kaydet'}
-                </button>
-                {!alertEditId ? (
-                  <button type="button" className="btn btn-light border px-3" onClick={resetAlertForm}>
-                    Temizle
-                  </button>
-                ) : null}
-              </div>
-            </div>
-
-            <div className="panel-card p-4 carrier-alert-list-card">
-              <div className="d-flex justify-content-between align-items-center mb-3">
-                <h4 className="fw-bold mb-0">Kayıtlı Bildirim Kuralları</h4>
-                <span className="badge text-bg-light fs-6">{carrierAlerts.length} adet</span>
-              </div>
-              {carrierAlerts.length === 0 ? (
-                <div className="carrier-alert-empty text-secondary">
-                  <i className="bi bi-bell-slash me-2"></i>
-                  Henüz bildirim kuralı eklenmedi.
-                </div>
-              ) : (
-                <div className="table-responsive">
-                  <table className="table align-middle carrier-alert-table">
-                    <thead>
-                      <tr>
-                        <th>Kural</th>
-                        <th>Filtre</th>
-                        <th>Durum</th>
-                        <th className="text-end">İşlem</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {carrierAlerts.map((alert) => (
-                        <tr key={alert._id}>
-                          <td>
-                            <div className="fw-semibold">{alert.name}</div>
-                            <small className="text-secondary">{formatDate(alert.createdAt)}</small>
-                          </td>
-                          <td>
-                            <span className="badge text-bg-light me-1">
-                              {alert.transportMode === 'all' ? 'Tümü' : MODE_LABEL[alert.transportMode]}
-                            </span>
-                            {alert.city ? <span className="badge text-bg-light me-1">{alert.city}</span> : null}
-                            {alert.district ? <span className="badge text-bg-light me-1">{alert.district}</span> : null}
-                            {alert.loadTypeSlug ? (
-                              <span className="badge text-bg-light">
-                                {loadTypeLabelMap[alert.loadTypeSlug] || alert.loadTypeSlug}
-                              </span>
-                            ) : null}
-                          </td>
-                          <td>
-                            <span className={`badge ${alert.isActive ? 'text-bg-success' : 'text-bg-secondary'}`}>
-                              {alert.isActive ? 'Aktif' : 'Pasif'}
-                            </span>
-                          </td>
-                          <td className="text-end">
-                            <div className="d-inline-flex gap-2">
-                              <button type="button" className="btn btn-sm btn-outline-primary px-3" onClick={() => startEditAlert(alert)}>
-                                Düzenle
-                              </button>
-                              <button
-                                type="button"
-                                className="btn btn-sm btn-outline-warning px-3"
-                                disabled={alertActionLoading === alert._id}
-                                onClick={() => toggleCarrierAlert(alert)}
-                              >
-                                {alert.isActive ? 'Pasif Yap' : 'Aktif Yap'}
-                              </button>
-                              <button
-                                type="button"
-                                className="btn btn-sm btn-outline-danger px-3"
-                                disabled={alertActionLoading === alert._id}
-                                onClick={() => deleteCarrierAlert(alert._id)}
-                              >
-                                Sil
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </div>
-        ) : null}
       </section>
     );
   }
 
   return (
     <section className="container py-5">
-      <h1 className="shipment-page-title mb-4">Gönderi Oluştur</h1>
+      <div className="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-4">
+        <h1 className="shipment-page-title mb-0">Gönderi Oluştur</h1>
+        <div className="d-flex flex-wrap gap-2">
+          <Link to="/hesabim?panel=shipments&shipperTab=open_pool" className="btn btn-sm btn-outline-primary">
+            Aktif İlanlar
+          </Link>
+          <Link to="/hesabim?panel=shipments&shipperTab=completed" className="btn btn-sm btn-outline-success">
+            Tamamlanan İlanlar
+          </Link>
+          <Link to="/hesabim?panel=shipments&shipperTab=expired" className="btn btn-sm btn-outline-danger">
+            Süresi Biten İlanlar
+          </Link>
+        </div>
+      </div>
       {message ? <div className="alert alert-warning">{message}</div> : null}
-
-      <div className="shipment-create-shell">
-        <div className="panel-card p-4">
-          <h3 className="shipment-section-title">Oluşturma Tipi</h3>
-          <div className="shipment-load-scope-switch shipment-mode-switch mt-1">
+      {registerContractPending.length > 0 ? (
+        <div className="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-2">
+          <div>
+            <strong>Güncel sözleşme onayı gerekli.</strong>
+            <div className="small">
+              {registerContractPending.length} sözleşme güncellendi. Yük işlemlerine devam etmek için onaylayın.
+            </div>
+          </div>
+          <div className="d-flex gap-2">
             <button
               type="button"
-              className={`shipment-mode-btn shipment-mode-btn--quick shipment-mode-btn--xl ${creationMode === 'quick' ? 'is-active' : ''}`}
-              onClick={() => setCreationMode('quick')}
+              className="btn btn-sm btn-warning"
+              disabled={registerContractSaving}
+              onClick={() => void handleResolveRegisterContracts()}
             >
-              Hızlı Yük Oluştur
+              {registerContractSaving ? 'Kaydediliyor...' : 'Sözleşmeleri Onayla'}
             </button>
             <button
               type="button"
-              className={`shipment-mode-btn shipment-mode-btn--detailed shipment-mode-btn--xl ${creationMode === 'detailed' ? 'is-active' : ''}`}
-              onClick={() => setCreationMode('detailed')}
+              className="btn btn-sm btn-outline-secondary"
+              disabled={registerContractChecking}
+              onClick={() => void refreshRegisterContractCompliance(profile?.role)}
             >
-              Detaylı Yük Oluştur
+              {registerContractChecking ? 'Kontrol ediliyor...' : 'Yenile'}
             </button>
           </div>
-          <small className="text-secondary d-block mt-2">
-            {!creationMode
-              ? 'Önce oluşturma tipini seçin. Alt alanlar seçiminize göre açılır.'
-              : creationMode === 'quick'
-                ? 'Hızlı modda temel bilgilerle ilan açılır, yük tipi ve araç tipi otomatik atanır.'
-                : 'Detaylı modda tüm alanları doldurarak daha hassas eşleşme alırsınız.'}
-          </small>
-          {creationMode === 'quick' ? (
-            <div className="mt-3">
-              <label className="form-label mb-2">Hızlı Yük Tipi (Belli Başlı)</label>
-              <div className="shipment-preset-row">
-                {(quickLoadTypeOptions.length ? quickLoadTypeOptions : (formOptions?.cargoTypes || []).slice(0, 6)).map((item) => (
-                  <button
-                    key={item.id}
-                    type="button"
-                    className={`shipment-preset-chip ${effectiveLoadTypeSlug === item.slug ? 'is-active' : ''}`}
-                    onClick={() => setSelectedLoadTypeSlug(item.slug)}
-                  >
-                    {item.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ) : null}
         </div>
-        {creationMode ? (
-          <>
+      ) : null}
+
+      {registerContractPending.length === 0 ? (
+        <div className="shipment-create-shell">
+          <div className="panel-card p-4">
+            <h3 className="shipment-section-title">Oluşturma Tipi</h3>
+            <div className="shipment-load-scope-switch shipment-mode-switch mt-1">
+              <button
+                type="button"
+                className={`shipment-mode-btn shipment-mode-btn--quick shipment-mode-btn--xl ${creationMode === 'quick' ? 'is-active' : ''}`}
+                onClick={() => setCreationMode('quick')}
+              >
+                Hızlı Yük Oluştur
+              </button>
+              <button
+                type="button"
+                className={`shipment-mode-btn shipment-mode-btn--detailed shipment-mode-btn--xl ${creationMode === 'detailed' ? 'is-active' : ''}`}
+                onClick={() => setCreationMode('detailed')}
+              >
+                Detaylı Yük Oluştur
+              </button>
+            </div>
+            <small className="text-secondary d-block mt-2">
+              {!creationMode
+                ? 'Önce oluşturma tipini seçin. Alt alanlar seçiminize göre açılır.'
+                : creationMode === 'quick'
+                  ? 'Hızlı modda temel bilgilerle ilan açılır, yük tipi ve araç tipi otomatik atanır.'
+                  : 'Detaylı modda tüm alanları doldurarak daha hassas eşleşme alırsınız.'}
+            </small>
+            {creationMode === 'quick' ? (
+              <div className="mt-3">
+                <label className="form-label mb-2">Hızlı Yük Tipi (Belli Başlı)</label>
+                <div className="shipment-preset-row">
+                  {(quickLoadTypeOptions.length ? quickLoadTypeOptions : (formOptions?.cargoTypes || []).slice(0, 6)).map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={`shipment-preset-chip ${effectiveLoadTypeSlug === item.slug ? 'is-active' : ''}`}
+                      onClick={() => setSelectedLoadTypeSlug(item.slug)}
+                    >
+                      {item.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+          {creationMode ? (
+            <>
         <div className="panel-card p-4">
           <h3 className="shipment-section-title">1. Zaman ve Taşıma</h3>
           <div className="shipment-load-scope-switch shipment-mode-switch mt-1 mb-3">
@@ -2794,6 +3096,38 @@ export function AppPage() {
         </div>
         ) : null}
 
+        {creationMode === 'detailed' ? (
+        <div className="panel-card p-4">
+          <h3 className="shipment-section-title">Seçim Özeti</h3>
+          <div className="row g-2">
+            <div className="col-md-6 col-lg-3">
+              <div className="border rounded-3 p-2 h-100">
+                <small className="text-secondary d-block">Gönderi Segmenti</small>
+                <strong>{segmentConfig.label}</strong>
+              </div>
+            </div>
+            <div className="col-md-6 col-lg-3">
+              <div className="border rounded-3 p-2 h-100">
+                <small className="text-secondary d-block">Alt Kategori</small>
+                <strong>{activeSubCategory?.label || '-'}</strong>
+              </div>
+            </div>
+            <div className="col-md-6 col-lg-3">
+              <div className="border rounded-3 p-2 h-100">
+                <small className="text-secondary d-block">Yük Tipi</small>
+                <strong>{selectedLoadTypeLabel}</strong>
+              </div>
+            </div>
+            <div className="col-md-6 col-lg-3">
+              <div className="border rounded-3 p-2 h-100">
+                <small className="text-secondary d-block">Araç Tipi</small>
+                <strong>{selectedVehicleTypeLabel}</strong>
+              </div>
+            </div>
+          </div>
+        </div>
+        ) : null}
+
 
 
 
@@ -2849,9 +3183,17 @@ export function AppPage() {
             {submitting ? 'Kaydediliyor...' : creationMode === 'quick' ? 'Hızlı Yük Oluştur' : 'Önizle ve Yayınla'}
           </button>
         </div>
-          </>
-        ) : null}
-      </div>
+            </>
+          ) : null}
+        </div>
+      ) : (
+        <div className="panel-card p-4">
+          <h3 className="shipment-section-title mb-2">Yük Oluşturma Geçici Olarak Beklemede</h3>
+          <p className="text-secondary mb-0">
+            Güncel sözleşme onayı tamamlanmadan yük oluşturma adımları görüntülenmez.
+          </p>
+        </div>
+      )}
 
       {previewOpen ? (
         <div className="shipment-preview-backdrop" onClick={() => setPreviewOpen(false)}>
@@ -2870,11 +3212,13 @@ export function AppPage() {
               <div className="col-md-6"><strong>Başlık:</strong> {title || '-'}</div>
               <div className="col-md-6"><strong>Taşıma Modu:</strong> {MODE_LABEL[computedTransportMode]}</div>
               <div className="col-md-6"><strong>Yük Yapısı:</strong> {loadScope}</div>
+              <div className="col-md-6"><strong>Gönderi Segmenti:</strong> {segmentConfig.label}</div>
+              <div className="col-md-6"><strong>Alt Kategori:</strong> {activeSubCategory?.label || '-'}</div>
               <div className="col-md-6"><strong>Zaman:</strong> {scheduleMode === 'today' ? 'Bugün' : scheduleMode === 'tomorrow' ? 'Yarın' : 'Planlı Tarih'}</div>
               <div className="col-md-6"><strong>Ölçü / Kapasite:</strong> {measurementValue ? `${measurementValue} ${measurementUnit}` : '-'}</div>
               <div className="col-md-6"><strong>Teslim Tarihi:</strong> {isTimedDelivery ? (deadlineDate ? `${deadlineDate} ${deadlineTime || ''}`.trim() : '-') : 'Saatli değil'}</div>
-              <div className="col-md-6"><strong>Yük Tipi:</strong> {formOptions?.cargoTypes?.find((c) => c.slug === effectiveLoadTypeSlug)?.name || '-'}</div>
-              <div className="col-md-6"><strong>Araç Tipi:</strong> {formOptions?.vehicleTypes?.find((v) => v.slug === effectiveVehicleTypeSlug)?.name || '-'}</div>
+              <div className="col-md-6"><strong>Yük Tipi:</strong> {selectedLoadTypeLabel}</div>
+              <div className="col-md-6"><strong>Araç Tipi:</strong> {selectedVehicleTypeLabel}</div>
               <div className="col-md-6"><strong>Mesafe:</strong> {routeInfo ? `${routeInfo.distanceKm} km` : '-'}</div>
               <div className="col-md-6">
                 <strong>Süre:</strong>{' '}

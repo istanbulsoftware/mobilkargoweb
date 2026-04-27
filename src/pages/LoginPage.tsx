@@ -5,6 +5,16 @@ import { api } from '../lib/api';
 
 type LoginMethod = 'password' | 'otp';
 
+const normalizePhoneForApi = (value: string) => {
+  const trimmed = String(value || '').trim();
+  const digits = trimmed.replace(/\D/g, '');
+  if (!digits) return trimmed;
+  if (digits.startsWith('90') && digits.length === 12) {
+    return `0${digits.slice(2)}`;
+  }
+  return digits;
+};
+
 export function LoginPage() {
   const navigate = useNavigate();
   const [method, setMethod] = useState<LoginMethod>('password');
@@ -27,7 +37,12 @@ export function LoginPage() {
   };
 
   const submitPassword = async () => {
-    const { data } = await api.post('/auth/login', { phone: identifier, password });
+    const normalizedPhone = normalizePhoneForApi(identifier);
+    const { data } = await api.post('/auth/login', {
+      phone: normalizedPhone,
+      identifier: String(identifier || '').trim(),
+      password: String(password || '').trim(),
+    });
     localStorage.setItem('an_user_token', data?.token || '');
     if (data?.user) {
       localStorage.setItem('an_user_profile', JSON.stringify(data.user));
@@ -38,7 +53,12 @@ export function LoginPage() {
   };
 
   const submitOtp = async () => {
-    const { data } = await api.post('/auth/login-otp', { phone: identifier, code: otpCode });
+    const normalizedPhone = normalizePhoneForApi(identifier);
+    const { data } = await api.post('/auth/login-otp', {
+      phone: normalizedPhone,
+      identifier: String(identifier || '').trim(),
+      code: String(otpCode || '').trim(),
+    });
     localStorage.setItem('an_user_token', data?.token || '');
     if (data?.user) {
       localStorage.setItem('an_user_profile', JSON.stringify(data.user));
@@ -69,7 +89,11 @@ export function LoginPage() {
     setOtpSending(true);
     setMessage('');
     try {
-      const { data } = await api.post('/auth/request-login-otp', { phone: identifier });
+      const normalizedPhone = normalizePhoneForApi(identifier);
+      const { data } = await api.post('/auth/request-login-otp', {
+        phone: normalizedPhone,
+        identifier: String(identifier || '').trim(),
+      });
       setOtpSent(true);
       const debug = data?.otpDebugCode ? ` (debug: ${data.otpDebugCode})` : '';
       setMessage(`OTP kodu gönderildi${debug}`);

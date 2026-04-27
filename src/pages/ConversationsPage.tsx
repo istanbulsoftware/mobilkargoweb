@@ -98,7 +98,17 @@ export function ConversationsPage() {
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
   const [rows, setRows] = useState<ConversationRow[]>([]);
-  const [me, setMe] = useState<ViewerProfile | null>(null);
+  const [me] = useState<ViewerProfile | null>(() => {
+    try {
+      const raw = localStorage.getItem('an_user_profile');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed?.id) return null;
+      return { id: String(parsed.id), role: parsed.role } as ViewerProfile;
+    } catch {
+      return null;
+    }
+  });
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<InboxFilter>('all');
 
@@ -115,31 +125,33 @@ export function ConversationsPage() {
   const [highlightedMessageId, setHighlightedMessageId] = useState('');
 
   const socketRef = useRef<Socket | null>(null);
+  const selectedConversationIdRef = useRef('');
+  const queryConversationIdRef = useRef('');
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const messageNodeRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const didInitialScrollRef = useRef(false);
   const typingTimerRef = useRef<number | null>(null);
   const typingClearRef = useRef<Record<string, number>>({});
+  const joinedConversationRef = useRef('');
 
   const loadInbox = async () => {
     if (!token) {
       setRows([]);
       return;
     }
-    const [{ data: profile }, { data }] = await Promise.all([
-      api.get<ViewerProfile>('/users/me/profile'),
-      api.get<ConversationRow[]>('/conversations/my'),
-    ]);
-    setMe(profile || null);
+    const { data } = await api.get<ConversationRow[]>('/conversations/my');
     const nextRows = Array.isArray(data) ? data : [];
     setRows(nextRows);
 
-    if (queryConversationId && nextRows.some((row) => row._id === queryConversationId)) {
-      setSelectedConversationId(queryConversationId);
+    const queryConversationIdCurrent = queryConversationIdRef.current;
+    const selectedConversationIdCurrent = selectedConversationIdRef.current;
+
+    if (queryConversationIdCurrent && nextRows.some((row) => row._id === queryConversationIdCurrent)) {
+      setSelectedConversationId(queryConversationIdCurrent);
       return;
     }
 
-    if (selectedConversationId && nextRows.some((row) => row._id === selectedConversationId)) return;
+    if (selectedConversationIdCurrent && nextRows.some((row) => row._id === selectedConversationIdCurrent)) return;
 
     if (nextRows[0]?._id) {
       setSelectedConversationId(nextRows[0]._id);
@@ -153,7 +165,7 @@ export function ConversationsPage() {
       const { data } = await api.get<ConversationDetailResponse>(`/conversations/${conversationId}`);
       setChatMessages(Array.isArray(data?.messages) ? data.messages : []);
       setChatTitle(data?.conversation?.shipmentId?.title || 'Mesajlaşma');
-      await api.patch(`/conversations/${conversationId}/read`);
+      void api.patch(`/conversations/${conversationId}/read`).catch(() => undefined);
       didInitialScrollRef.current = false;
       setMessage('');
     } catch (error: any) {
@@ -163,6 +175,14 @@ export function ConversationsPage() {
       setChatLoading(false);
     }
   };
+
+  useEffect(() => {
+    queryConversationIdRef.current = queryConversationId;
+  }, [queryConversationId]);
+
+  useEffect(() => {
+    selectedConversationIdRef.current = selectedConversationId;
+  }, [selectedConversationId]);
 
   useEffect(() => {
     const load = async () => {
@@ -194,7 +214,11 @@ export function ConversationsPage() {
 
     socket.on('connect', () => {
       setSocketConnected(true);
-      if (selectedConversationId) socket.emit('join:conversation', selectedConversationId);
+      const activeConversationId = selectedConversationIdRef.current;
+      if (activeConversationId) {
+        socket.emit('join:conversation', activeConversationId);
+        joinedConversationRef.current = activeConversationId;
+      }
     });
     socket.on('disconnect', () => setSocketConnected(false));
 
@@ -206,7 +230,7 @@ export function ConversationsPage() {
       const cid = String(payload?.conversationId || '');
       if (!cid) return;
       void loadInbox().catch(() => undefined);
-      if (cid !== selectedConversationId) return;
+      if (cid !== selectedConversationIdRef.current) return;
 
       setChatMessages((prev) => {
         const exists = prev.some((item) => item._id === payload._id);
@@ -222,7 +246,7 @@ export function ConversationsPage() {
     });
 
     socket.on('conversation:message_updated', (payload: any) => {
-      if (!selectedConversationId) return;
+      if (!selectedConversationIdRef.current) return;
       if (payload?.message?._id) {
         setChatMessages((prev) => {
           const idx = prev.findIndex((item) => item._id === payload.message._id);
@@ -270,9 +294,9 @@ export function ConversationsPage() {
     });
 
     return () => {
-      if (selectedConversationId) {
+      if (joinedConversationRef.current) {
         try {
-          socket.emit('leave:conversation', selectedConversationId);
+          socket.emit('leave:conversation', joinedConversationRef.current);
         } catch {
           // no-op
         }
@@ -280,18 +304,27 @@ export function ConversationsPage() {
       socket.disconnect();
       socketRef.current = null;
       setSocketConnected(false);
+      joinedConversationRef.current = '';
     };
-  }, [token, selectedConversationId, me?.id]);
+  }, [token, me?.id]);
 
   useEffect(() => {
-    if (!selectedConversationId) return;
     if (socketRef.current) {
       try {
-        socketRef.current.emit('join:conversation', selectedConversationId);
+        if (joinedConversationRef.current && joinedConversationRef.current !== selectedConversationId) {
+          socketRef.current.emit('leave:conversation', joinedConversationRef.current);
+        }
+        if (selectedConversationId) {
+          socketRef.current.emit('join:conversation', selectedConversationId);
+          joinedConversationRef.current = selectedConversationId;
+        } else {
+          joinedConversationRef.current = '';
+        }
       } catch {
         // no-op
       }
     }
+    if (!selectedConversationId) return;
     void loadConversationDetail(selectedConversationId);
   }, [selectedConversationId]);
 

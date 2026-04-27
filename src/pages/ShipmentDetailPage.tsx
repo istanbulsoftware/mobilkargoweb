@@ -2,6 +2,7 @@
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { io, type Socket } from 'socket.io-client';
 import { api, apiOrigin } from '../lib/api';
+import { requireOfferContractConsent } from '../lib/offerContracts';
 import Swal from 'sweetalert2';
 
 type OfferLite = {
@@ -12,6 +13,21 @@ type OfferLite = {
   createdAt?: string;
   carrierUserId?: { fullName?: string; phone?: string; status?: string };
   vehicleId?: { _id?: string; plateMasked?: string; brand?: string; model?: string };
+  carrierReview?: { avg?: number; count?: number };
+  carrierContractConsent?: {
+    isAccepted?: boolean;
+    contentSlug?: string;
+    contentTitle?: string;
+    acceptedAt?: string;
+    snapshotHtml?: string;
+  };
+  shipperContractConsent?: {
+    isAccepted?: boolean;
+    contentSlug?: string;
+    contentTitle?: string;
+    acceptedAt?: string;
+    snapshotHtml?: string;
+  };
 };
 
 type ShipmentDetail = {
@@ -45,7 +61,15 @@ type ShipmentDetail = {
   canViewOffers?: boolean;
   offers?: OfferLite[];
   myOffer?: OfferLite | null;
-  listingOwner?: { id?: string; fullName?: string; phone?: string } | null;
+  listingOwner?: {
+    id?: string;
+    fullName?: string;
+    phone?: string;
+    companyName?: string;
+    companyTitle?: string;
+    accountType?: string;
+    reviewSummary?: { count?: number; avg?: number };
+  } | null;
   recommendedVehicleTypes?: Array<{ _id?: string; name?: string; slug?: string }>;
   offerStats?: {
     total: number;
@@ -64,6 +88,10 @@ type ViewerProfile = {
   id?: string;
   fullName?: string;
   role?: 'shipper' | 'carrier' | 'admin';
+  phone?: string;
+  email?: string;
+  city?: string;
+  district?: string;
 };
 
 type ConversationMessage = {
@@ -76,6 +104,36 @@ type ConversationMessage = {
   createdAt?: string;
 };
 
+type ShipmentReviewRow = {
+  _id: string;
+  rating?: number;
+  comment?: string;
+  createdAt?: string;
+  reviewerUserId?: { _id?: string; fullName?: string; role?: string } | string;
+  reviewedUserId?: { _id?: string; fullName?: string; role?: string } | string;
+};
+
+type ShipmentReviewResponse = {
+  shipmentId?: string;
+  status?: string;
+  canReview?: boolean;
+  myReview?: ShipmentReviewRow | null;
+  reviewTarget?: { userId?: string; fullName?: string; role?: string } | null;
+  reviews?: ShipmentReviewRow[];
+};
+
+type OfferContractRequirementLite = {
+  required?: boolean;
+  contract?: {
+    slug?: string;
+    title?: string;
+    checkboxLabel?: string;
+    body?: string;
+    snapshotHtml?: string;
+    contractUrl?: string;
+  };
+};
+
 export function ShipmentDetailPage() {
   const navigate = useNavigate();
   const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '').trim();
@@ -86,7 +144,13 @@ export function ShipmentDetailPage() {
   const [shipment, setShipment] = useState<ShipmentDetail | null>(null);
   const [viewerRole, setViewerRole] = useState<ViewerProfile['role']>();
   const [viewerUserId, setViewerUserId] = useState('');
+  const [viewerFullName, setViewerFullName] = useState('');
+  const [viewerPhone, setViewerPhone] = useState('');
+  const [viewerEmail, setViewerEmail] = useState('');
+  const [viewerCity, setViewerCity] = useState('');
+  const [viewerDistrict, setViewerDistrict] = useState('');
   const [activeTab, setActiveTab] = useState<'detail' | 'map' | 'offers'>('detail');
+  const [shipperOfferSort, setShipperOfferSort] = useState<'newest' | 'oldest' | 'price_asc' | 'price_desc' | 'rating_desc' | 'comments_desc'>('newest');
   const [carrierVehicles, setCarrierVehicles] = useState<Array<{ _id: string; plateMasked?: string; brand?: string; model?: string; status?: string; vehicleTypeId?: string | { _id?: string } }>>([]);
   const [carrierOfferDraft, setCarrierOfferDraft] = useState<{ vehicleId: string; amount: string; note: string }>({
     vehicleId: '',
@@ -94,6 +158,15 @@ export function ShipmentDetailPage() {
     note: '',
   });
   const [carrierOfferLoading, setCarrierOfferLoading] = useState(false);
+  const [carrierOfferContractRequired, setCarrierOfferContractRequired] = useState(false);
+  const [carrierOfferContractSlug, setCarrierOfferContractSlug] = useState('');
+  const [carrierOfferContractTitle, setCarrierOfferContractTitle] = useState('Teklif Sözleşmesi');
+  const [carrierOfferContractCheckboxLabel, setCarrierOfferContractCheckboxLabel] = useState(
+    'Okudum, anladım ve kabul ediyorum.',
+  );
+  const [carrierOfferContractHtml, setCarrierOfferContractHtml] = useState('');
+  const [carrierOfferContractUrl, setCarrierOfferContractUrl] = useState('');
+  const [carrierOfferContractAccepted, setCarrierOfferContractAccepted] = useState(false);
   const [mapsReady, setMapsReady] = useState(false);
   const [mapError, setMapError] = useState('');
   const [routeInfo, setRouteInfo] = useState<{ distanceKm: number; durationMin: number; summary: string } | null>(null);
@@ -104,6 +177,11 @@ export function ShipmentDetailPage() {
   const [chatLoading, setChatLoading] = useState(false);
   const [chatSending, setChatSending] = useState(false);
   const [chatConnecting, setChatConnecting] = useState(false);
+  const [completing, setCompleting] = useState(false);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  const [reviewData, setReviewData] = useState<ShipmentReviewResponse | null>(null);
+  const [reviewDraft, setReviewDraft] = useState<{ rating: number; comment: string }>({ rating: 0, comment: '' });
 
   const routeMapContainerRef = useRef<HTMLDivElement | null>(null);
   const routeMapRef = useRef<any>(null);
@@ -112,6 +190,31 @@ export function ShipmentDetailPage() {
   const socketRef = useRef<Socket | null>(null);
 
   const modeLabel = (mode?: 'intracity' | 'intercity') => (mode === 'intercity' ? 'Şehirler Arası' : 'Şehir İçi');
+  const maskName = (value?: string) => {
+    const raw = String(value || '').trim();
+    if (!raw) return 'K*** T***';
+    return raw
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 3)
+      .map((part) => `${part.charAt(0).toLocaleUpperCase('tr-TR')}***`)
+      .join(' ');
+  };
+  const getInitials = (value?: string) => {
+    const raw = String(value || '').trim();
+    if (!raw) return 'KT';
+    const parts = raw.split(/\s+/).filter(Boolean);
+    if (!parts.length) return 'KT';
+    if (parts.length === 1) return parts[0].slice(0, 1).toLocaleUpperCase('tr-TR');
+    return `${parts[0].slice(0, 1)}${parts[1].slice(0, 1)}`.toLocaleUpperCase('tr-TR');
+  };
+  const escapeHtml = (value?: string) =>
+    String(value || '-')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
 
   const statusLabel = (status?: string) => {
     const map: Record<string, string> = {
@@ -143,7 +246,26 @@ export function ShipmentDetailPage() {
     if (!value) return '-';
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return '-';
-    return date.toLocaleString('tr-TR');
+    return new Intl.DateTimeFormat('tr-TR', {
+      day: '2-digit',
+      month: 'long',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(date);
+  };
+  const formatCurrencyInput = (raw?: string | number) => {
+    const digits = String(raw ?? '')
+      .replace(/[^\d]/g, '')
+      .replace(/^0+(?=\d)/, '');
+    if (!digits) return '';
+    return Number(digits).toLocaleString('tr-TR');
+  };
+  const parseCurrencyInput = (raw?: string) => {
+    const digits = String(raw || '').replace(/[^\d]/g, '');
+    if (!digits) return 0;
+    const num = Number(digits);
+    return Number.isFinite(num) ? num : 0;
   };
 
   const load = async (options?: { silent?: boolean }) => {
@@ -159,9 +281,19 @@ export function ShipmentDetailPage() {
         const { data: me } = await api.get<ViewerProfile>('/users/me/profile');
         setViewerRole(me?.role);
         setViewerUserId(String(me?.id || ''));
+        setViewerFullName(String(me?.fullName || ''));
+        setViewerPhone(String(me?.phone || ''));
+        setViewerEmail(String(me?.email || ''));
+        setViewerCity(String(me?.city || ''));
+        setViewerDistrict(String(me?.district || ''));
       } catch {
         setViewerRole(undefined);
         setViewerUserId('');
+        setViewerFullName('');
+        setViewerPhone('');
+        setViewerEmail('');
+        setViewerCity('');
+        setViewerDistrict('');
       }
 
       try {
@@ -199,6 +331,31 @@ export function ShipmentDetailPage() {
   }, [shipmentId]);
 
   const offers = useMemo(() => shipment?.offers || [], [shipment?.offers]);
+  const shipperSortedOffers = useMemo(() => {
+    const rows = [...offers];
+    if (shipperOfferSort === 'oldest') {
+      rows.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
+      return rows;
+    }
+    if (shipperOfferSort === 'price_asc') {
+      rows.sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
+      return rows;
+    }
+    if (shipperOfferSort === 'price_desc') {
+      rows.sort((a, b) => Number(b.price || 0) - Number(a.price || 0));
+      return rows;
+    }
+    if (shipperOfferSort === 'rating_desc') {
+      rows.sort((a, b) => Number(b.carrierReview?.avg || 0) - Number(a.carrierReview?.avg || 0));
+      return rows;
+    }
+    if (shipperOfferSort === 'comments_desc') {
+      rows.sort((a, b) => Number(b.carrierReview?.count || 0) - Number(a.carrierReview?.count || 0));
+      return rows;
+    }
+    rows.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    return rows;
+  }, [offers, shipperOfferSort]);
   const viewMode = useMemo<'shipper' | 'carrier' | 'readonly'>(() => {
     if (viewerRole === 'carrier') return 'carrier';
     if (shipment?.canViewOffers) return 'shipper';
@@ -212,11 +369,49 @@ export function ShipmentDetailPage() {
     () => (shipment?.recommendedVehicleTypes || []).filter((item) => item?.name || item?.slug),
     [shipment?.recommendedVehicleTypes],
   );
+  const recommendedVehicleTypeIds = useMemo(
+    () => new Set((shipment?.recommendedVehicleTypes || []).map((x) => String(x._id || '')).filter(Boolean)),
+    [shipment?.recommendedVehicleTypes],
+  );
+  const suitableCarrierVehicles = useMemo(() => {
+    if (!carrierVehicles.length) return [] as typeof carrierVehicles;
+    if (!recommendedVehicleTypeIds.size) return carrierVehicles;
+    return carrierVehicles.filter((v) => {
+      const typeId = typeof v.vehicleTypeId === 'string' ? v.vehicleTypeId : v.vehicleTypeId?._id;
+      return typeId ? recommendedVehicleTypeIds.has(String(typeId)) : false;
+    });
+  }, [carrierVehicles, recommendedVehicleTypeIds]);
+  const singleSuitableVehicle = suitableCarrierVehicles.length === 1 ? suitableCarrierVehicles[0] : null;
   const sentOffers = useMemo(() => {
     if (canViewOffers) return [] as OfferLite[];
     if (offers.length) return offers;
     return shipment?.myOffer ? [shipment.myOffer] : [];
   }, [canViewOffers, offers, shipment?.myOffer]);
+  const activeCarrierOffer = isCarrierViewer ? sentOffers[0] || null : null;
+  const carrierMutableStatuses = new Set(['submitted', 'updated']);
+  const isShipmentOfferableForCarrier = ['published', 'offer_collecting'].includes(String(shipment?.status || ''));
+  const carrierOfferLockReason = useMemo(() => {
+    if (!isCarrierViewer) return '';
+    if (!shipment) return 'Yük bilgisi bulunamadı.';
+    if (!isShipmentOfferableForCarrier) {
+      return `Bu ilan ${statusLabel(shipment.status)} durumunda olduğu için teklif işlemleri kapalı.`;
+    }
+    if (activeCarrierOffer && !carrierMutableStatuses.has(String(activeCarrierOffer.status || ''))) {
+      const statusMap: Record<string, string> = {
+        accepted: 'Teklifiniz kabul edildiği için artık güncelleyemez veya geri çekemezsiniz.',
+        rejected: 'Teklifiniz reddedildiği için artık güncelleyemez veya geri çekemezsiniz.',
+        withdrawn: 'Teklifinizi geri çektiğiniz için yeniden düzenleyemezsiniz.',
+        expired: 'Teklifinizin süresi dolduğu için güncelleme kapalı.',
+        cancelled: 'Teklif kaydı iptal edildiği için güncelleme kapalı.',
+      };
+      return statusMap[String(activeCarrierOffer.status || '')] || 'Teklifinizin mevcut durumu güncellemeye uygun değil.';
+    }
+    return '';
+  }, [isCarrierViewer, shipment, isShipmentOfferableForCarrier, activeCarrierOffer]);
+  const canCarrierEditOffer = Boolean(isCarrierViewer && !carrierOfferLockReason);
+  const canCarrierWithdrawOffer = Boolean(
+    canCarrierEditOffer && activeCarrierOffer && carrierMutableStatuses.has(String(activeCarrierOffer.status || '')),
+  );
   const offerTabCount = useMemo(() => {
     if (canViewOffers) return offers.length;
     if (isCarrierViewer) return sentOffers.length;
@@ -230,12 +425,86 @@ export function ShipmentDetailPage() {
     if (canViewOffers) return offers.find((offer) => offer.status === 'accepted') || null;
     return null;
   }, [isCarrierViewer, shipment?.myOffer, canViewOffers, offers]);
+  const acceptedContractDocs = useMemo(() => {
+    const offer = acceptedOfferForConversation;
+    if (!offer) return [] as Array<{
+      key: string;
+      roleLabel: string;
+      title: string;
+      acceptedAt?: string;
+      slug?: string;
+      snapshotHtml: string;
+    }>;
+    const rows: Array<{
+      key: string;
+      roleLabel: string;
+      title: string;
+      acceptedAt?: string;
+      slug?: string;
+      snapshotHtml: string;
+    }> = [];
+    if (offer.carrierContractConsent?.isAccepted && offer.carrierContractConsent?.snapshotHtml) {
+      rows.push({
+        key: 'carrier',
+        roleLabel: 'Taşıyıcı Onayı',
+        title: offer.carrierContractConsent.contentTitle || 'Taşıyıcı Teklif Sözleşmesi',
+        acceptedAt: offer.carrierContractConsent.acceptedAt,
+        slug: offer.carrierContractConsent.contentSlug,
+        snapshotHtml: offer.carrierContractConsent.snapshotHtml,
+      });
+    }
+    if (offer.shipperContractConsent?.isAccepted && offer.shipperContractConsent?.snapshotHtml) {
+      rows.push({
+        key: 'shipper',
+        roleLabel: 'Gönderici Onayı',
+        title: offer.shipperContractConsent.contentTitle || 'Gönderici Teklif Kabul Sözleşmesi',
+        acceptedAt: offer.shipperContractConsent.acceptedAt,
+        slug: offer.shipperContractConsent.contentSlug,
+        snapshotHtml: offer.shipperContractConsent.snapshotHtml,
+      });
+    }
+    return rows;
+  }, [acceptedOfferForConversation]);
   const canStartConversation = Boolean(
     shipmentId &&
       shipment?.status === 'matched' &&
       acceptedOfferForConversation?._id,
   );
+  const canCompleteShipment = Boolean(
+    shipmentId &&
+      shipment?.status === 'matched' &&
+      (canViewOffers || (isCarrierViewer && acceptedOfferForConversation?._id)),
+  );
+  const canViewAddressDetails = Boolean(
+    shipment?.status === 'matched' &&
+      (canViewOffers || (isCarrierViewer && acceptedOfferForConversation?._id)),
+  );
+  const shouldLoadReviews = Boolean(
+    shipmentId &&
+      shipment?.status === 'completed' &&
+      (canViewOffers || isCarrierViewer),
+  );
   const showConversationCard = Boolean((isCarrierViewer || canViewOffers) && canStartConversation);
+  const shouldShowOfferPromptCard = Boolean(isCarrierViewer && sentOffers.length === 0);
+  const counterpartyReview = useMemo(() => {
+    const rows = reviewData?.reviews || [];
+    if (!viewerUserId || rows.length === 0) return null;
+    return (
+      rows.find((row) => {
+        const reviewerId = typeof row.reviewerUserId === 'string' ? row.reviewerUserId : String(row.reviewerUserId?._id || '');
+        const reviewedId = typeof row.reviewedUserId === 'string' ? row.reviewedUserId : String(row.reviewedUserId?._id || '');
+        return reviewedId === viewerUserId && reviewerId !== viewerUserId;
+      }) || null
+    );
+  }, [reviewData?.reviews, viewerUserId]);
+  const counterpartyReviewerName = useMemo(() => {
+    if (!counterpartyReview) return '';
+    return typeof counterpartyReview.reviewerUserId === 'string'
+      ? ''
+      : String(counterpartyReview.reviewerUserId?.fullName || '');
+  }, [counterpartyReview]);
+  const shouldShowReciprocalReviewPrompt = Boolean(reviewData?.canReview && !reviewData?.myReview && counterpartyReview);
+  const canViewMutualReviews = Boolean(reviewData?.myReview && counterpartyReview);
   const conversationPeer = useMemo(() => {
     if (!showConversationCard || !shipment) return { title: 'Mesajlaşma', name: '-', phone: '-' };
     if (isCarrierViewer) {
@@ -251,8 +520,154 @@ export function ShipmentDetailPage() {
       phone: acceptedOfferForConversation?.carrierUserId?.phone || '-',
     };
   }, [showConversationCard, shipment, isCarrierViewer, acceptedOfferForConversation]);
+  const maskedOwnerDisplayName = useMemo(() => {
+    const raw = String(shipment?.listingOwner?.fullName || '').trim();
+    if (!raw) return 'Y*** S***';
+    return raw
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 3)
+      .map((part) => `${part.charAt(0).toLocaleUpperCase('tr-TR')}***`)
+      .join(' ');
+  }, [shipment?.listingOwner?.fullName]);
+  const ownerInitials = useMemo(() => {
+    const raw = String(shipment?.listingOwner?.fullName || '').trim();
+    if (!raw) return 'YS';
+    const parts = raw.split(/\s+/).filter(Boolean);
+    if (!parts.length) return 'YS';
+    if (parts.length === 1) return parts[0].slice(0, 1).toLocaleUpperCase('tr-TR');
+    return `${parts[0].slice(0, 1)}${parts[1].slice(0, 1)}`.toLocaleUpperCase('tr-TR');
+  }, [shipment?.listingOwner?.fullName]);
+  const acceptedCarrierDisplay = useMemo(() => {
+    const raw = String(acceptedOfferForConversation?.carrierUserId?.fullName || '').trim();
+    if (!raw) return { maskedName: 'T***', initials: 'T' };
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const maskedName = parts
+      .slice(0, 3)
+      .map((part) => `${part.charAt(0).toLocaleUpperCase('tr-TR')}***`)
+      .join(' ');
+    const initials =
+      parts.length === 1
+        ? parts[0].slice(0, 1).toLocaleUpperCase('tr-TR')
+        : `${parts[0].slice(0, 1)}${parts[1].slice(0, 1)}`.toLocaleUpperCase('tr-TR');
+    return { maskedName, initials };
+  }, [acceptedOfferForConversation?.carrierUserId?.fullName]);
+  const maskedOwnerCompanyDisplay = useMemo(() => {
+    const raw = String(shipment?.listingOwner?.companyTitle || shipment?.listingOwner?.companyName || '').trim();
+    if (!raw) return '';
+    return raw
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 5)
+      .map((part) => `${part.charAt(0).toLocaleUpperCase('tr-TR')}***`)
+      .join(' ');
+  }, [shipment?.listingOwner?.companyTitle, shipment?.listingOwner?.companyName]);
+  const ownerReviewSummary = useMemo(() => {
+    const summaryCount = Number(shipment?.listingOwner?.reviewSummary?.count || 0);
+    const summaryAvg = Number(shipment?.listingOwner?.reviewSummary?.avg || 0);
+    if (summaryCount > 0) {
+      return {
+        count: summaryCount,
+        avg: Number(summaryAvg.toFixed(1)),
+      };
+    }
+    const ownerId = String(shipment?.listingOwner?.id || '').trim();
+    const rows = reviewData?.reviews || [];
+    if (!ownerId || !rows.length) return { count: 0, avg: 0 };
+    const ownerRows = rows.filter((row) => {
+      const reviewedId = typeof row.reviewedUserId === 'string' ? row.reviewedUserId : String(row.reviewedUserId?._id || '');
+      return reviewedId === ownerId;
+    });
+    if (!ownerRows.length) return { count: 0, avg: 0 };
+    const total = ownerRows.reduce((sum, row) => sum + Number(row.rating || 0), 0);
+    return {
+      count: ownerRows.length,
+      avg: Number((total / ownerRows.length).toFixed(1)),
+    };
+  }, [shipment?.listingOwner?.reviewSummary?.count, shipment?.listingOwner?.reviewSummary?.avg, shipment?.listingOwner?.id, reviewData?.reviews]);
+  const conversationPeerReviewSummary = useMemo(() => {
+    const rows = reviewData?.reviews || [];
+    const reviewTargetId = String(reviewData?.reviewTarget?.userId || '').trim();
+    const shipmentSpecificSummary = (() => {
+      if (!rows.length || !reviewTargetId) return null;
+      const targetRows = rows.filter((row) => {
+        const reviewedId = typeof row.reviewedUserId === 'string' ? row.reviewedUserId : String(row.reviewedUserId?._id || '');
+        return reviewedId === reviewTargetId;
+      });
+      if (!targetRows.length) return null;
+      const total = targetRows.reduce((sum, row) => sum + Number(row.rating || 0), 0);
+      return {
+        count: targetRows.length,
+        avg: Number((total / targetRows.length).toFixed(1)),
+      };
+    })();
+
+    if (isCarrierViewer) {
+      return {
+        count: Number(ownerReviewSummary.count || 0),
+        avg: Number(ownerReviewSummary.avg || 0),
+      };
+    }
+    if (shipmentSpecificSummary) {
+      return shipmentSpecificSummary;
+    }
+    return {
+      count: Number(acceptedOfferForConversation?.carrierReview?.count || 0),
+      avg: Number(acceptedOfferForConversation?.carrierReview?.avg || 0),
+    };
+  }, [
+    reviewData?.reviews,
+    reviewData?.reviewTarget?.userId,
+    isCarrierViewer,
+    ownerReviewSummary.count,
+    ownerReviewSummary.avg,
+    acceptedOfferForConversation?.carrierReview?.count,
+    acceptedOfferForConversation?.carrierReview?.avg,
+  ]);
+  const summaryPersonCard = useMemo(() => {
+    if (!shipment) {
+      return { title: 'İlan Sahibi', name: 'Y*** S***', initials: 'YS', company: '', review: { count: 0, avg: 0 } };
+    }
+    if (!isCarrierViewer && canViewOffers && acceptedOfferForConversation) {
+      return {
+        title: 'Taşıyıcı',
+        name: acceptedCarrierDisplay.maskedName,
+        initials: acceptedCarrierDisplay.initials,
+        company: '',
+        review: {
+          count: Number(conversationPeerReviewSummary.count || 0),
+          avg: Number(conversationPeerReviewSummary.avg || 0),
+        },
+      };
+    }
+    return {
+      title: 'İlan Sahibi',
+      name: maskedOwnerDisplayName,
+      initials: ownerInitials,
+      company: maskedOwnerCompanyDisplay,
+      review: {
+        count: Number(ownerReviewSummary.count || 0),
+        avg: Number(ownerReviewSummary.avg || 0),
+      },
+    };
+  }, [
+    shipment,
+    isCarrierViewer,
+    canViewOffers,
+    acceptedOfferForConversation,
+    acceptedCarrierDisplay.maskedName,
+    acceptedCarrierDisplay.initials,
+    conversationPeerReviewSummary.count,
+    conversationPeerReviewSummary.avg,
+    maskedOwnerDisplayName,
+    ownerInitials,
+    maskedOwnerCompanyDisplay,
+    ownerReviewSummary.count,
+    ownerReviewSummary.avg,
+  ]);
   const operationDetails = useMemo(
     () => [
+      { label: 'Yük Tipi', value: desc.cargoType || '-' },
       { label: 'Yük Yapısı', value: desc.loadType || '-' },
       { label: 'Yükleme Tarihi', value: desc.loadDate || formatDateTime(shipment?.scheduledPickupAt) },
       { label: 'Teslim Son Tarihi', value: desc.deadline || formatDateTime(shipment?.deliveryDeadlineAt) },
@@ -283,6 +698,7 @@ export function ShipmentDetailPage() {
       },
     ],
     [
+      desc.cargoType,
       desc.loadType,
       desc.loadDate,
       desc.deadline,
@@ -309,7 +725,7 @@ export function ShipmentDetailPage() {
   );
 
   useEffect(() => {
-    if (!isCarrierViewer || activeTab !== 'offers') return;
+    if (!isCarrierViewer || !['offers', 'detail'].includes(activeTab)) return;
     let mounted = true;
     const loadVehicles = async () => {
       try {
@@ -330,29 +746,63 @@ export function ShipmentDetailPage() {
   }, [isCarrierViewer, activeTab]);
 
   useEffect(() => {
+    if (!isCarrierViewer || !['offers', 'detail'].includes(activeTab) || !shipmentId) return;
+    let mounted = true;
+    const loadCarrierOfferContractRequirement = async () => {
+      try {
+        const { data } = await api.get<OfferContractRequirementLite>('/offers/contract-requirements', {
+          params: { shipmentId, action: 'carrier_offer' },
+        });
+        if (!mounted) return;
+        const required = Boolean(data?.required);
+        setCarrierOfferContractRequired(required);
+        setCarrierOfferContractSlug(String(data?.contract?.slug || ''));
+        setCarrierOfferContractTitle(String(data?.contract?.title || 'Teklif Sözleşmesi'));
+        const backendCheckboxLabel = String(data?.contract?.checkboxLabel || '').trim();
+        setCarrierOfferContractCheckboxLabel(
+          backendCheckboxLabel
+            ? backendCheckboxLabel.replace(/okudum,?\s*anlad[ıi]m?.*kabul ediyorum\.?/i, 'Sözleşmeyi okudum ve kabul ediyorum.')
+            : 'Sözleşmeyi okudum ve kabul ediyorum.',
+        );
+        setCarrierOfferContractHtml(String(data?.contract?.snapshotHtml || data?.contract?.body || ''));
+        setCarrierOfferContractUrl(String(data?.contract?.contractUrl || ''));
+        setCarrierOfferContractAccepted(!required);
+      } catch {
+        if (!mounted) return;
+        setCarrierOfferContractRequired(false);
+        setCarrierOfferContractSlug('');
+        setCarrierOfferContractTitle('Teklif Sözleşmesi');
+        setCarrierOfferContractCheckboxLabel('Sözleşmeyi okudum ve kabul ediyorum.');
+        setCarrierOfferContractHtml('');
+        setCarrierOfferContractUrl('');
+        setCarrierOfferContractAccepted(false);
+      }
+    };
+    void loadCarrierOfferContractRequirement();
+    return () => {
+      mounted = false;
+    };
+  }, [isCarrierViewer, activeTab, shipmentId]);
+
+  useEffect(() => {
     if (!isCarrierViewer) return;
     const my = shipment?.myOffer || null;
-    const recommendedIds = new Set((shipment?.recommendedVehicleTypes || []).map((x) => String(x._id || '')).filter(Boolean));
 
     let preferredVehicleId = '';
     if (my?.vehicleId?._id) preferredVehicleId = String(my.vehicleId._id);
 
-    if (!preferredVehicleId && recommendedIds.size > 0) {
-      const matched = carrierVehicles.find((v) => {
-        const typeId = typeof v.vehicleTypeId === 'string' ? v.vehicleTypeId : v.vehicleTypeId?._id;
-        return typeId ? recommendedIds.has(String(typeId)) : false;
-      });
-      if (matched?._id) preferredVehicleId = matched._id;
+    if (!preferredVehicleId && suitableCarrierVehicles[0]?._id) {
+      preferredVehicleId = suitableCarrierVehicles[0]._id;
     }
 
     if (!preferredVehicleId && carrierVehicles[0]?._id) preferredVehicleId = carrierVehicles[0]._id;
 
     setCarrierOfferDraft({
       vehicleId: preferredVehicleId,
-      amount: my?.price ? String(my.price) : '',
+      amount: my?.price ? formatCurrencyInput(my.price) : '',
       note: my?.serviceNotes || '',
     });
-  }, [isCarrierViewer, shipment?.myOffer, shipment?.recommendedVehicleTypes, carrierVehicles]);
+  }, [isCarrierViewer, shipment?.myOffer, carrierVehicles, suitableCarrierVehicles]);
 
   const pickupCoords = useMemo(() => {
     const coords = shipment?.pickupGeo?.coordinates;
@@ -533,7 +983,25 @@ export function ShipmentDetailPage() {
     setActionLoadingId(offerId);
     setMessage('');
     try {
-      await api.patch(`/offers/${offerId}/${action}`);
+      if (action === 'accept') {
+        if (!shipmentId) {
+          setActionLoadingId('');
+          return;
+        }
+        const contractConsent = await requireOfferContractConsent({
+          shipmentId,
+          offerId,
+          action: 'shipper_accept',
+          partiesIntroHtml: buildShipperAcceptContractPartiesHtml(offerId),
+        });
+        if (contractConsent === null) {
+          setActionLoadingId('');
+          return;
+        }
+        await api.patch(`/offers/${offerId}/${action}`, { contractConsent });
+      } else {
+        await api.patch(`/offers/${offerId}/${action}`);
+      }
       await load({ silent: true });
       setMessage(action === 'accept' ? 'Teklif kabul edildi.' : 'Teklif reddedildi.');
     } catch (error: any) {
@@ -543,28 +1011,281 @@ export function ShipmentDetailPage() {
     }
   };
 
+  const buildShipperAcceptContractPartiesHtml = (offerId: string) => {
+    const todayLabel = new Date().toLocaleDateString('tr-TR');
+    const selectedOffer = offers.find((item) => item._id === offerId);
+
+    const shipperName = viewerFullName || shipment?.listingOwner?.fullName || 'Yük Sahibi';
+    const shipperPhone = viewerPhone || shipment?.listingOwner?.phone || '-';
+    const shipperAddress = [viewerDistrict, viewerCity].filter(Boolean).join(' / ') || [shipment?.pickupDistrict, shipment?.pickupCity].filter(Boolean).join(' / ') || '-';
+    const shipperEmail = viewerEmail || '-';
+
+    const carrierName = selectedOffer?.carrierUserId?.fullName || 'Taşıyıcı';
+    const carrierPhone = selectedOffer?.carrierUserId?.phone || '-';
+
+    return `
+      <div style="margin-bottom:14px; border:1px solid #e5e7eb; border-radius:10px; padding:12px; background:#f8fafc;">
+        <h4 style="margin:0 0 8px; font-size:16px;">1. TARAFLAR</h4>
+        <p style="margin:0 0 8px;">
+          İşbu Taşıma Hizmet Sözleşmesi (“Sözleşme”), aşağıda bilgileri yer alan:
+        </p>
+        <p style="margin:0 0 6px;"><strong>1.1. YÜK / GÖNDERİ SAHİBİ (“Taşıtan”)</strong></p>
+        <p style="margin:0;">
+          Ad / Ticaret Unvanı: ${escapeHtml(shipperName)}<br/>
+          T.C. Kimlik No / Vergi No: -<br/>
+          Adres: ${escapeHtml(shipperAddress)}<br/>
+          Telefon: ${escapeHtml(shipperPhone)}<br/>
+          E-posta: ${escapeHtml(shipperEmail)}<br/>
+        </p>
+        <p style="margin:10px 0 6px;"><strong>1.2. TAŞIMACI (“Taşıyıcı”)</strong></p>
+        <p style="margin:0;">
+          Ad / Ticaret Unvanı: ${escapeHtml(carrierName)}<br/>
+          T.C. Kimlik No / Vergi No: -<br/>
+          Yetki Belge No: -<br/>
+          Adres: -<br/>
+          Telefon: ${escapeHtml(carrierPhone)}<br/>
+          E-posta: -<br/>
+        </p>
+        <p style="margin:10px 0 0;">
+          Kargomobil dijital nakliye platformu üzerinden bir taşıma hizmeti için eşleşmeleri üzerine elektronik ortamda akdedilmiştir.
+          Taşıtan ve Taşıyıcı birlikte “Taraflar” olarak anılacaktır.<br/>
+          Tarih: ${escapeHtml(todayLabel)}
+        </p>
+      </div>
+    `;
+  };
+
+  const buildCarrierOfferContractDocumentHtml = () => {
+    const todayLabel = new Date().toLocaleDateString('tr-TR');
+    const shipperName = shipment?.listingOwner?.fullName || 'Yük Sahibi';
+    const shipperPhone = shipment?.listingOwner?.phone || '-';
+    const shipperAddress = [shipment?.pickupDistrict, shipment?.pickupCity].filter(Boolean).join(' / ') || '-';
+    const carrierName = viewerFullName || shipment?.myOffer?.carrierUserId?.fullName || '-';
+    const carrierPhone = shipment?.myOffer?.carrierUserId?.phone || viewerPhone || '-';
+    const carrierAddress = [viewerDistrict, viewerCity].filter(Boolean).join(' / ') || '-';
+    const carrierEmail = viewerEmail || '-';
+    const partiesIntroHtml = `
+      <div style="margin-bottom:14px; border:1px solid #e5e7eb; border-radius:10px; padding:12px; background:#f8fafc;">
+        <h4 style="margin:0 0 8px; font-size:16px;">1. TARAFLAR</h4>
+        <p style="margin:0 0 8px;">
+          İşbu Taşıma Hizmet Sözleşmesi (“Sözleşme”), aşağıda bilgileri yer alan:
+        </p>
+        <p style="margin:0 0 6px;"><strong>1.1. YÜK / GÖNDERİ SAHİBİ (“Taşıtan”)</strong></p>
+        <p style="margin:0;">
+          Ad / Ticaret Unvanı: ${escapeHtml(shipperName)}<br/>
+          T.C. Kimlik No / Vergi No: -<br/>
+          Adres: ${escapeHtml(shipperAddress)}<br/>
+          Telefon: ${escapeHtml(shipperPhone)}<br/>
+          E-posta: -<br/>
+        </p>
+        <p style="margin:10px 0 6px;"><strong>1.2. TAŞIMACI (“Taşıyıcı”)</strong></p>
+        <p style="margin:0;">
+          Ad / Ticaret Unvanı: ${escapeHtml(carrierName)}<br/>
+          T.C. Kimlik No / Vergi No: -<br/>
+          Yetki Belge No: -<br/>
+          Adres: ${escapeHtml(carrierAddress)}<br/>
+          Telefon: ${escapeHtml(carrierPhone)}<br/>
+          E-posta: ${escapeHtml(carrierEmail)}<br/>
+        </p>
+        <p style="margin:10px 0 0;">
+          Kargomobil dijital nakliye platformu üzerinden bir taşıma hizmeti için eşleşmeleri üzerine elektronik ortamda akdedilmiştir.
+          Taşıtan ve Taşıyıcı birlikte “Taraflar” olarak anılacaktır.<br/>
+          Tarih: ${escapeHtml(todayLabel)}
+        </p>
+      </div>
+    `;
+
+    const fullContractHtml = `${partiesIntroHtml}${carrierOfferContractHtml || '<p>Sözleşme metni bulunamadı.</p>'}`;
+    return { partiesIntroHtml, fullContractHtml };
+  };
+
+  const downloadCarrierOfferContractPdf = () => {
+    const { fullContractHtml } = buildCarrierOfferContractDocumentHtml();
+    const win = window.open('', '_blank', 'width=980,height=800');
+    if (!win) return;
+    win.document.open();
+    win.document.write(`
+      <html>
+        <head>
+          <title>${escapeHtml(carrierOfferContractTitle || 'Teklif Sözleşmesi')}</title>
+          <meta charset="utf-8" />
+          <style>
+            @page { size: A4; margin: 16mm; }
+            body { font-family: Arial, sans-serif; margin: 0; color: #111827; line-height: 1.45; }
+            h1, h2, h3, h4 { margin: 0 0 10px; }
+            p { margin: 0 0 8px; }
+          </style>
+        </head>
+        <body>${fullContractHtml}</body>
+      </html>
+    `);
+    win.document.close();
+    win.focus();
+    const triggerPrint = () => {
+      try {
+        win.focus();
+        win.print();
+      } catch {
+        // no-op
+      }
+    };
+    win.onload = () => {
+      window.setTimeout(triggerPrint, 120);
+    };
+    window.setTimeout(triggerPrint, 420);
+  };
+
+  const openCarrierOfferContractLightbox = async () => {
+    if (!carrierOfferContractHtml && !carrierOfferContractUrl) {
+      await Swal.fire({
+        icon: 'info',
+        title: 'Sözleşme Bulunamadı',
+        text: 'Görüntülenecek sözleşme metni bulunamadı.',
+        confirmButtonText: 'Tamam',
+      });
+      return;
+    }
+    const { partiesIntroHtml } = buildCarrierOfferContractDocumentHtml();
+
+    await Swal.fire({
+      title: carrierOfferContractTitle || 'Teklif Sözleşmesi',
+      width: 980,
+      showConfirmButton: false,
+      showCloseButton: true,
+      didOpen: () => {
+        const btn = document.getElementById('download-contract-pdf');
+        if (btn) {
+          btn.addEventListener('click', () => downloadCarrierOfferContractPdf());
+        }
+      },
+      html: `
+        <div style="text-align:left;">
+          <div style="margin-bottom:10px; display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="download-contract-pdf" type="button" class="swal2-confirm swal2-styled" style="display:inline-flex;">PDF Olarak İndir</button>
+          </div>
+          <div style="max-height:62vh; overflow:auto; border:1px solid #e5e7eb; border-radius:10px; padding:12px; background:#fff;">
+            ${partiesIntroHtml}
+            ${carrierOfferContractHtml || '<p>Sözleşme metni bulunamadı.</p>'}
+          </div>
+        </div>
+      `,
+    });
+  };
+
+  const downloadAcceptedContractSnapshotPdf = (title: string, snapshotHtml: string) => {
+    const win = window.open('', '_blank', 'width=980,height=800');
+    if (!win) return;
+    win.document.open();
+    win.document.write(`
+      <html>
+        <head>
+          <title>${escapeHtml(title || 'Sözleşme Snapshot')}</title>
+          <meta charset="utf-8" />
+          <style>
+            @page { size: A4; margin: 16mm; }
+            body { font-family: Arial, sans-serif; margin: 0; color: #111827; line-height: 1.45; }
+            h1, h2, h3, h4 { margin: 0 0 10px; }
+            p { margin: 0 0 8px; }
+          </style>
+        </head>
+        <body>${snapshotHtml || '<p>Sözleşme metni bulunamadı.</p>'}</body>
+      </html>
+    `);
+    win.document.close();
+    win.focus();
+    const triggerPrint = () => {
+      try {
+        win.focus();
+        win.print();
+      } catch {
+        // no-op
+      }
+    };
+    win.onload = () => {
+      window.setTimeout(triggerPrint, 120);
+    };
+    window.setTimeout(triggerPrint, 420);
+  };
+
+  const openAcceptedContractSnapshotLightbox = async (title: string, snapshotHtml: string) => {
+    if (!snapshotHtml) {
+      await Swal.fire({
+        icon: 'info',
+        title: 'Sözleşme Bulunamadı',
+        text: 'Görüntülenecek sözleşme metni bulunamadı.',
+        confirmButtonText: 'Tamam',
+      });
+      return;
+    }
+
+    await Swal.fire({
+      title: title || 'Kabul Edilen Sözleşme',
+      width: 980,
+      showConfirmButton: false,
+      showCloseButton: true,
+      didOpen: () => {
+        const btn = document.getElementById('download-accepted-contract-pdf');
+        if (btn) {
+          btn.addEventListener('click', () => downloadAcceptedContractSnapshotPdf(title, snapshotHtml));
+        }
+      },
+      html: `
+        <div style="text-align:left;">
+          <div style="margin-bottom:10px; display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="download-accepted-contract-pdf" type="button" class="swal2-confirm swal2-styled" style="display:inline-flex;">PDF Olarak İndir</button>
+          </div>
+          <div style="max-height:62vh; overflow:auto; border:1px solid #e5e7eb; border-radius:10px; padding:12px; background:#fff;">
+            ${snapshotHtml}
+          </div>
+        </div>
+      `,
+    });
+  };
+
   const handleCarrierOfferSubmit = async () => {
     if (!shipmentId) return;
+    if (carrierOfferLockReason) {
+      setMessage(carrierOfferLockReason);
+      await Swal.fire({ icon: 'warning', title: 'İşlem Kısıtlı', text: carrierOfferLockReason, confirmButtonText: 'Tamam' });
+      return;
+    }
     if (!carrierOfferDraft.vehicleId || !carrierOfferDraft.amount) {
       setMessage('Teklif için araç ve tutar zorunludur.');
       await Swal.fire({ icon: 'warning', title: 'Uyarı', text: 'Teklif için araç ve tutar zorunludur.', confirmButtonText: 'Tamam' });
       return;
     }
-    const amount = Number(carrierOfferDraft.amount);
+    const amount = parseCurrencyInput(carrierOfferDraft.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
       setMessage('Teklif tutarı geçerli bir sayı olmalıdır.');
       await Swal.fire({ icon: 'warning', title: 'Uyarı', text: 'Teklif tutarı geçerli bir sayı olmalıdır.', confirmButtonText: 'Tamam' });
+      return;
+    }
+    if (carrierOfferContractRequired && !carrierOfferContractAccepted) {
+      const warningText = 'Devam etmek için sözleşmeyi işaretlemeniz zorunludur.';
+      setMessage(warningText);
+      await Swal.fire({ icon: 'warning', title: 'Sözleşme Onayı Gerekli', text: warningText, confirmButtonText: 'Tamam' });
       return;
     }
 
     setCarrierOfferLoading(true);
     try {
       const successText = sentOffers.length ? 'Teklif başarıyla güncellendi.' : 'Teklif başarıyla kaydedildi.';
+      const contractConsent = carrierOfferContractRequired
+        ? { accepted: true, contractSlug: carrierOfferContractSlug || undefined }
+        : await requireOfferContractConsent({
+            shipmentId,
+            action: 'carrier_offer',
+          });
+      if (contractConsent === null) {
+        setCarrierOfferLoading(false);
+        return;
+      }
       await api.post('/offers', {
         shipmentId,
         vehicleId: carrierOfferDraft.vehicleId,
         amount,
         note: carrierOfferDraft.note || undefined,
+        contractConsent,
       });
       setMessage(successText);
       await Swal.fire({ icon: 'success', title: 'Başarılı', text: successText, confirmButtonText: 'Tamam' });
@@ -579,6 +1300,11 @@ export function ShipmentDetailPage() {
   };
 
   const handleCarrierWithdraw = async (offerId: string) => {
+    if (carrierOfferLockReason) {
+      setMessage(carrierOfferLockReason);
+      await Swal.fire({ icon: 'warning', title: 'İşlem Kısıtlı', text: carrierOfferLockReason, confirmButtonText: 'Tamam' });
+      return;
+    }
     setCarrierOfferLoading(true);
     try {
       await api.patch(`/offers/${offerId}/withdraw`);
@@ -641,6 +1367,97 @@ export function ShipmentDetailPage() {
     }
   };
 
+  const loadReviews = async () => {
+    if (!shipmentId || !shouldLoadReviews) {
+      setReviewData(null);
+      return;
+    }
+    setReviewLoading(true);
+    try {
+      const { data } = await api.get<ShipmentReviewResponse>(`/reviews/shipment/${shipmentId}`);
+      setReviewData(data || null);
+        if (data?.myReview) {
+          setReviewDraft({
+            rating: Number(data.myReview.rating || 5),
+            comment: String(data.myReview.comment || ''),
+          });
+        } else {
+          setReviewDraft({ rating: 0, comment: '' });
+        }
+    } catch (error: any) {
+      setReviewData(null);
+      setMessage(error?.response?.data?.message || 'Değerlendirme bilgileri yüklenemedi.');
+    } finally {
+      setReviewLoading(false);
+    }
+  };
+
+  const completeShipment = async () => {
+    if (!shipmentId || !canCompleteShipment) return;
+    const confirm = await Swal.fire({
+      icon: 'question',
+      title: 'Taşımayı Tamamla',
+      text: 'Bu yükü tamamlandı olarak işaretlemek istiyor musunuz?',
+      showCancelButton: true,
+      confirmButtonText: 'Evet, tamamla',
+      cancelButtonText: 'Vazgeç',
+    });
+    if (!confirm.isConfirmed) return;
+
+    setCompleting(true);
+    try {
+      await api.patch(`/shipments/${shipmentId}/complete`);
+      await Swal.fire({ icon: 'success', title: 'Tamamlandı', text: 'Yük tamamlandı olarak işaretlendi.', confirmButtonText: 'Tamam' });
+      await load({ silent: true });
+      await loadReviews();
+    } catch (error: any) {
+      const errorText = error?.response?.data?.message || 'Yük tamamlanamadı.';
+      setMessage(errorText);
+      await Swal.fire({ icon: 'error', title: 'Hata', text: errorText, confirmButtonText: 'Tamam' });
+    } finally {
+      setCompleting(false);
+    }
+  };
+
+  const submitReview = async () => {
+    if (!shipmentId || !reviewData?.canReview) {
+      await Swal.fire({
+        icon: 'warning',
+        title: 'Uyarı',
+        text: 'Bu ilan için şu anda yorum yapamazsınız.',
+        confirmButtonText: 'Tamam',
+      });
+      return;
+    }
+    const rating = Number(reviewDraft.rating || 0);
+    if (!rating || rating < 1 || rating > 5) {
+      setMessage('Lütfen 1-5 arasında puan verin.');
+      await Swal.fire({
+        icon: 'warning',
+        title: 'Uyarı',
+        text: 'Lütfen 1-5 arasında puan verin.',
+        confirmButtonText: 'Tamam',
+      });
+      return;
+    }
+    setReviewSubmitting(true);
+    try {
+      await api.post('/reviews', {
+        shipmentId,
+        rating,
+        comment: reviewDraft.comment?.trim() || undefined,
+      });
+      await Swal.fire({ icon: 'success', title: 'Teşekkürler', text: 'Değerlendirmeniz kaydedildi.', confirmButtonText: 'Tamam' });
+      await loadReviews();
+    } catch (error: any) {
+      const errorText = error?.response?.data?.message || 'Değerlendirme kaydedilemedi.';
+      setMessage(errorText);
+      await Swal.fire({ icon: 'error', title: 'Hata', text: errorText, confirmButtonText: 'Tamam' });
+    } finally {
+      setReviewSubmitting(false);
+    }
+  };
+
   useEffect(() => {
     if (!chatOpen || !conversationId) return;
     const token = localStorage.getItem('an_user_token');
@@ -681,6 +1498,15 @@ export function ShipmentDetailPage() {
       setChatConnecting(false);
     };
   }, [chatOpen, conversationId]);
+
+  useEffect(() => {
+    if (!shouldLoadReviews) {
+      setReviewData(null);
+      return;
+    }
+    void loadReviews();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shouldLoadReviews, shipmentId, viewerRole]);
 
   if (loading) {
     return (
@@ -731,7 +1557,159 @@ export function ShipmentDetailPage() {
                 </div>
               </div>
 
-              <div className="shipment-route-card">
+              {shipment.status === 'completed' ? (
+                <div className="panel-card p-3 mt-3 mb-4">
+                  <div className="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+                    <div>
+                      <small className="text-secondary d-block">Puan & Yorum</small>
+                      <strong>Tamamlanan İlan Değerlendirmeleri</strong>
+                    </div>
+                    {reviewData?.reviewTarget?.fullName ? (
+                      <span className="badge text-bg-light border">
+                        Değerlendirilecek: {reviewData.reviewTarget.fullName}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {!reviewLoading && !canViewMutualReviews && !reviewData?.myReview && Boolean(counterpartyReview) ? (
+                    <div className="review-reciprocal-alert mb-3">
+                      Karşı taraf yorum yaptı. Yorumu görmek için sen de yorum yap.
+                    </div>
+                  ) : null}
+
+                  {reviewLoading ? (
+                    <div className="text-secondary small">Değerlendirmeler yükleniyor...</div>
+                  ) : (
+                    <>
+                      {reviewData?.canReview ? (
+                        <div className="border rounded-3 p-3 mb-3">
+                          {shouldShowReciprocalReviewPrompt ? (
+                            <div className="alert alert-success border mb-2 py-2">
+                              <strong>{counterpartyReviewerName || 'Karşı taraf'}</strong> size yorum yaptı. Siz de yorumunuzu bırakabilirsiniz.
+                            </div>
+                          ) : null}
+                          <div className="d-flex align-items-center gap-2 mb-2">
+                            {[1, 2, 3, 4, 5].map((star) => (
+                              <button
+                                key={`review-star-${star}`}
+                                type="button"
+                                className={`btn btn-sm ${reviewDraft.rating >= star ? 'btn-warning' : 'btn-outline-secondary'}`}
+                                onClick={() => setReviewDraft((prev) => ({ ...prev, rating: star }))}
+                              >
+                                <i className="bi bi-star-fill"></i>
+                              </button>
+                            ))}
+                          </div>
+                          <textarea
+                            className="form-control mb-2"
+                            rows={3}
+                            maxLength={1000}
+                            placeholder="Yorumunuz (opsiyonel)"
+                            value={reviewDraft.comment}
+                            onChange={(e) => setReviewDraft((prev) => ({ ...prev, comment: e.target.value }))}
+                          />
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            disabled={reviewSubmitting}
+                            onClick={() => void submitReview()}
+                          >
+                            {reviewSubmitting ? 'Kaydediliyor...' : 'Yorum ve Puanı Kaydet'}
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="alert alert-light border small mb-3">
+                          {reviewData?.myReview
+                            ? 'Bu ilan için değerlendirmeniz zaten kaydedilmiş.'
+                            : 'Bu ilan için şu an değerlendirme yapma hakkınız bulunmuyor.'}
+                        </div>
+                      )}
+
+                      {canViewMutualReviews ? (
+                        <div className="d-grid gap-2">
+                          {(reviewData?.reviews || []).map((row) => {
+                            const reviewer = typeof row.reviewerUserId === 'string' ? '' : row.reviewerUserId?.fullName || 'Kullanıcı';
+                            return (
+                              <div key={row._id} className="border rounded-3 p-2">
+                                <div className="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                                  <strong className="small">{reviewer}</strong>
+                                  <span className="small text-warning">
+                                    {'★'.repeat(Math.max(0, Math.min(5, Number(row.rating || 0))))}
+                                  </span>
+                                </div>
+                                <div className="small text-secondary">{row.comment || 'Yorum bırakılmadı.'}</div>
+                                <div className="small text-secondary mt-1">{formatDateTime(row.createdAt)}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </>
+                  )}
+                </div>
+              ) : null}
+
+              {showConversationCard || canCompleteShipment ? (
+                <div className="row g-3 mt-1">
+                  {showConversationCard ? (
+                    <div className={canCompleteShipment ? 'col-lg-6' : 'col-12'}>
+                      <div className="panel-card p-3 h-100">
+                        <div className="d-flex justify-content-between align-items-center gap-3 flex-wrap">
+                          <div>
+                            <small className="text-secondary d-block">{conversationPeer.title}</small>
+                            <strong className="d-block">{conversationPeer.name}</strong>
+                            <span className="text-secondary small">{conversationPeer.phone}</span>
+                            {isCarrierViewer && maskedOwnerCompanyDisplay ? (
+                              <div className="text-secondary small mt-1">Firma: {maskedOwnerCompanyDisplay}</div>
+                            ) : null}
+                            <div className="shipment-owner-badges mt-2">
+                              <span className="shipment-owner-badge">
+                                <i className="bi bi-chat-left-text"></i>
+                                {conversationPeerReviewSummary.count} yorum
+                              </span>
+                              <span className="shipment-owner-badge is-score">
+                                <i className="bi bi-star-fill"></i>
+                                {conversationPeerReviewSummary.avg > 0 ? `${conversationPeerReviewSummary.avg.toFixed(1)} puan` : 'Puan yok'}
+                              </span>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            disabled={!canStartConversation || chatLoading}
+                            onClick={() => void startConversation()}
+                          >
+                            {chatLoading ? 'Hazırlanıyor...' : 'Mesajlaşmaya Başla'}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  {canCompleteShipment ? (
+                    <div className={showConversationCard ? 'col-lg-6' : 'col-12'}>
+                      <div className="panel-card p-3 h-100 border border-success-subtle">
+                        <div className="d-flex justify-content-between align-items-center gap-3 flex-wrap">
+                          <div>
+                            <small className="text-secondary d-block">Yük Tamamlama</small>
+                            <strong className="d-block">Bu taşıma tamamlandıysa işlemi kapatın</strong>
+                            <span className="text-secondary small">Tamamlandıktan sonra taraflar birbirine puan ve yorum bırakabilir.</span>
+                          </div>
+                          <button
+                            type="button"
+                            className="btn btn-success"
+                            disabled={!canCompleteShipment || completing}
+                            onClick={() => void completeShipment()}
+                          >
+                            {completing ? 'Tamamlanıyor...' : 'Taşımayı Tamamla'}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className={`shipment-route-card ${showConversationCard || canCompleteShipment ? 'mt-3' : ''}`}>
                 <div className="shipment-route-point">
                   <span className="dot from"></span>
                   <div>
@@ -749,22 +1727,108 @@ export function ShipmentDetailPage() {
                 </div>
               </div>
 
-              {showConversationCard ? (
-                <div className="panel-card p-3 mt-3">
-                  <div className="d-flex justify-content-between align-items-center gap-3 flex-wrap">
+              {recommendedVehicles.length ? (
+                <div className="shipment-recommended-strip mt-3">
+                  <div className="shipment-recommended-strip-head">
+                    <span className="shipment-recommended-strip-icon">
+                      <i className="bi bi-truck"></i>
+                    </span>
                     <div>
-                      <small className="text-secondary d-block">{conversationPeer.title}</small>
-                      <strong className="d-block">{conversationPeer.name}</strong>
-                      <span className="text-secondary small">{conversationPeer.phone}</span>
+                      <small>İlan İçin Uygun Araçlar</small>
+                      <strong>Bu yük için önerilen araç tipleri</strong>
                     </div>
-                    <button
-                      type="button"
-                      className="btn btn-primary"
-                      disabled={!canStartConversation || chatLoading}
-                      onClick={() => void startConversation()}
-                    >
-                      {chatLoading ? 'Hazırlanıyor...' : 'Mesajlaşmaya Başla'}
-                    </button>
+                  </div>
+                  <div className="shipment-recommended-list shipment-recommended-list-premium">
+                    {recommendedVehicles.map((vehicle) => (
+                      <span className="shipment-recommended-item shipment-recommended-item-premium" key={vehicle._id || vehicle.slug || vehicle.name}>
+                        <i className="bi bi-check2-circle me-1"></i>
+                        {vehicle.name || vehicle.slug}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {!showConversationCard ? (
+                <div className="shipment-owner-teaser mt-3">
+                  <div className="shipment-owner-avatar">{summaryPersonCard.initials}</div>
+                  <div className="shipment-owner-meta">
+                    <small>{summaryPersonCard.title}</small>
+                    <strong>{summaryPersonCard.name}</strong>
+                    {summaryPersonCard.company ? (
+                      <div className="text-secondary small mt-1">Firma: {summaryPersonCard.company}</div>
+                    ) : null}
+                    <div className="shipment-owner-badges">
+                      <span className="shipment-owner-badge">
+                        <i className="bi bi-chat-left-text"></i>
+                        {summaryPersonCard.review.count} yorum
+                      </span>
+                      <span className="shipment-owner-badge is-score">
+                        <i className="bi bi-star-fill"></i>
+                        {summaryPersonCard.review.avg > 0 ? `${summaryPersonCard.review.avg.toFixed(1)} puan` : 'Puan yok'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              {shouldShowOfferPromptCard ? (
+                <div className="shipment-offer-prompt-card mt-3">
+                  <div className="shipment-offer-prompt-content">
+                    <span className="shipment-offer-prompt-kicker">
+                      <i className="bi bi-lightning-charge-fill me-1"></i>
+                      Aksiyon Gerekli
+                    </span>
+                    <strong>Bu ilana henüz teklif vermedin</strong>
+                    <small>Hemen teklif vererek yük sahibinin seni değerlendirmesini sağlayabilirsin.</small>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn shipment-offer-prompt-btn"
+                    onClick={() => setActiveTab('offers')}
+                  >
+                    Hemen Teklif Ver
+                    <i className="bi bi-arrow-right ms-2"></i>
+                  </button>
+                </div>
+              ) : null}
+
+              {acceptedContractDocs.length > 0 ? (
+                <div className="panel-card p-3 mt-3">
+                  <div className="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-2">
+                    <div>
+                      <small className="text-secondary d-block">Sözleşme Arşivi</small>
+                      <strong>Kabul Edilen Sözleşmeler (Dönemsel Snapshot)</strong>
+                    </div>
+                  </div>
+                  <div className="d-grid gap-2">
+                    {acceptedContractDocs.map((doc) => (
+                      <div key={doc.key} className="border rounded-3 p-2 d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                        <div>
+                          <strong className="d-block">{doc.roleLabel}: {doc.title}</strong>
+                          <small className="text-secondary">
+                            Onay Tarihi: {formatDateTime(doc.acceptedAt)}
+                            {doc.slug ? ` · /content/${doc.slug}` : ''}
+                          </small>
+                        </div>
+                        <div className="d-flex gap-2">
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-outline-primary"
+                            onClick={() => void openAcceptedContractSnapshotLightbox(doc.title, doc.snapshotHtml)}
+                          >
+                            Sözleşmeyi Gör
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-outline-secondary"
+                            onClick={() => downloadAcceptedContractSnapshotPdf(doc.title, doc.snapshotHtml)}
+                          >
+                            PDF İndir
+                          </button>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               ) : null}
@@ -773,13 +1837,13 @@ export function ShipmentDetailPage() {
                 <div className="col-md-4">
                   <div className="shipment-mini-meta">
                     <small>Yükleme Tarihi</small>
-                    <strong>{shipment.scheduledPickupAt ? new Date(shipment.scheduledPickupAt).toLocaleString('tr-TR') : '-'}</strong>
+                    <strong>{formatDateTime(shipment.scheduledPickupAt)}</strong>
                   </div>
                 </div>
                 <div className="col-md-4">
                   <div className="shipment-mini-meta">
                     <small>Oluşturma Tarihi</small>
-                    <strong>{new Date(shipment.createdAt).toLocaleString('tr-TR')}</strong>
+                    <strong>{formatDateTime(shipment.createdAt)}</strong>
                   </div>
                 </div>
                 <div className="col-md-4">
@@ -809,47 +1873,39 @@ export function ShipmentDetailPage() {
                       </div>
                     </div>
                   ) : null}
-                  <div className="col-md-6">
-                    <div className="shipment-subsection-card h-100">
-                      <strong className="d-block mb-2">Operasyon Detayları</strong>
-                      <div className="shipment-detail-list">
-                        {operationDetails.map((item) => (
-                          <div className="shipment-detail-list-item" key={`op-${item.label}`}>
-                            <span>{item.label}</span>
-                            <strong>{item.value}</strong>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="col-md-6">
-                    <div className="shipment-subsection-card h-100">
-                      <strong className="d-block mb-2">Adres ve Ek Bilgiler</strong>
-                      <div className="shipment-detail-list">
-                        {addressDetails.map((item) => (
-                          <div className="shipment-detail-list-item" key={`address-${item.label}`}>
-                            <span>{item.label}</span>
-                            <strong>{item.value}</strong>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
-                  {recommendedVehicles.length ? (
+                  {canViewAddressDetails ? (
                     <div className="col-12">
-                      <div className="shipment-subsection-card">
-                        <strong className="d-block mb-2">İlan İçin Uygun Araçlar</strong>
-                        <div className="shipment-recommended-list">
-                          {recommendedVehicles.map((vehicle) => (
-                            <span className="shipment-recommended-item" key={vehicle._id || vehicle.slug || vehicle.name}>
-                              <i className="bi bi-truck me-1"></i>
-                              {vehicle.name || vehicle.slug}
-                            </span>
+                      <div className="shipment-subsection-card h-100">
+                        <strong className="d-block mb-2">Adres ve Ek Bilgiler</strong>
+                        <div className="shipment-detail-list">
+                          {addressDetails.map((item) => (
+                            <div className="shipment-detail-list-item" key={`address-${item.label}`}>
+                              <span>{item.label}</span>
+                              <strong>{item.value}</strong>
+                            </div>
                           ))}
                         </div>
                       </div>
                     </div>
                   ) : null}
+                  <div className="col-12">
+                    <div className="shipment-subsection-card shipment-subsection-card-operations h-100">
+                      <div className="shipment-subsection-head">
+                        <span className="shipment-subsection-head-icon">
+                          <i className="bi bi-stars"></i>
+                        </span>
+                        <strong className="mb-0">Operasyon Detayları</strong>
+                      </div>
+                      <div className="shipment-detail-list shipment-detail-list-operations">
+                        {operationDetails.map((item) => (
+                          <div className="shipment-detail-list-item shipment-detail-list-item-operations" key={`op-${item.label}`}>
+                            <span>{item.label}</span>
+                            <strong>{item.value}</strong>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
                   {desc.rawLines.length > 1 ? (
                     <div className="col-12">
                       <div className="shipment-subsection-card">
@@ -944,57 +2000,80 @@ export function ShipmentDetailPage() {
 
           {activeTab === 'offers' && canViewOffers ? (
             <div className="panel-card p-4">
-              <h4 className="fw-bold mb-3">Gelen Teklifler</h4>
-              <div className="table-responsive shipment-offers-table">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Taşımacı</th>
-                      <th>Araç</th>
-                      <th>Tutar</th>
-                      <th>Durum</th>
-                      <th>Tarih</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {offers.length === 0 ? (
-                      <tr><td colSpan={6} className="text-secondary">Bu yük için henüz teklif bulunmuyor.</td></tr>
-                    ) : (
-                      offers.map((offer) => (
-                        <tr key={offer._id}>
-                          <td>
-                            <div className="offer-carrier">
-                              <strong>{offer.carrierUserId?.fullName || '-'}</strong>
-                              <small>{offer.carrierUserId?.phone || '-'}</small>
-                            </div>
-                          </td>
-                          <td>{`${offer.vehicleId?.brand || ''} ${offer.vehicleId?.model || ''} ${offer.vehicleId?.plateMasked || ''}`.trim() || '-'}</td>
-                          <td>{typeof offer.price === 'number' ? `₺${offer.price}` : '-'}</td>
-                          <td><span className={`shipment-status-pill tone-${statusTone(offer.status)}`}>{statusLabel(offer.status)}</span></td>
-                          <td>{offer.createdAt ? new Date(offer.createdAt).toLocaleDateString('tr-TR') : '-'}</td>
-                          <td className="text-end">
-                            {['submitted', 'updated'].includes(offer.status) ? (
-                              <div className="d-flex gap-2 justify-content-end">
-                                <button
-                                  type="button"
-                                  className="btn btn-sm btn-success"
-                                  disabled={Boolean(actionLoadingId)}
-                                  onClick={() => void handleOfferAction(offer._id, 'accept')}
-                                >
-                                  {actionLoadingId === offer._id ? 'İşleniyor...' : 'Kabul'}
-                                </button>
-                              </div>
-                            ) : (
-                              <span className="text-secondary small">-</span>
-                            )}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
+              <div className="d-flex justify-content-between align-items-center gap-2 flex-wrap mb-3">
+                <h4 className="fw-bold mb-0">Gelen Teklifler</h4>
+                <select
+                  className="form-select form-select-sm shipment-offers-sort"
+                  value={shipperOfferSort}
+                  onChange={(e) =>
+                    setShipperOfferSort(
+                      e.target.value as 'newest' | 'oldest' | 'price_asc' | 'price_desc' | 'rating_desc' | 'comments_desc',
+                    )
+                  }
+                >
+                  <option value="newest">Sıralama: En Yeni</option>
+                  <option value="oldest">Sıralama: En Eski</option>
+                  <option value="price_asc">Fiyat: Düşükten Yükseğe</option>
+                  <option value="price_desc">Fiyat: Yüksekten Düşüğe</option>
+                  <option value="rating_desc">Puan: Yüksekten Düşüğe</option>
+                  <option value="comments_desc">Yorum: Çoktan Aza</option>
+                </select>
               </div>
+
+              {shipperSortedOffers.length === 0 ? (
+                <div className="text-secondary">Bu yük için henüz teklif bulunmuyor.</div>
+              ) : (
+                <div className="shipment-offer-premium-list">
+                  {shipperSortedOffers.map((offer) => {
+                    const fullName = offer.carrierUserId?.fullName || '';
+                    const masked = maskName(fullName);
+                    const initials = getInitials(fullName);
+                    const ratingAvg = Number(offer.carrierReview?.avg || 0);
+                    const ratingCount = Number(offer.carrierReview?.count || 0);
+                    return (
+                      <article key={offer._id} className="shipment-offer-premium-card">
+                        <div className="shipment-offer-premium-left">
+                          <span className="shipment-offer-avatar">{initials}</span>
+                          <div className="shipment-offer-meta">
+                            <strong>{masked}</strong>
+                            <small>{offer.carrierUserId?.phone || '-'}</small>
+                            <div className="shipment-offer-review-row">
+                              <span className="shipment-offer-review-pill">
+                                <i className="bi bi-chat-left-text"></i>
+                                {ratingCount} yorum
+                              </span>
+                              <span className="shipment-offer-review-pill is-score">
+                                <i className="bi bi-star-fill"></i>
+                                {ratingAvg > 0 ? `${ratingAvg.toFixed(1)} puan` : 'Puan yok'}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="shipment-offer-premium-mid">
+                          <span>{`${offer.vehicleId?.brand || ''} ${offer.vehicleId?.model || ''} ${offer.vehicleId?.plateMasked || ''}`.trim() || '-'}</span>
+                          <strong>{typeof offer.price === 'number' ? `₺${Math.round(offer.price).toLocaleString('tr-TR')}` : '-'}</strong>
+                          <small>{offer.createdAt ? formatDateTime(offer.createdAt) : '-'}</small>
+                        </div>
+                        <div className="shipment-offer-premium-right">
+                          <span className={`shipment-status-pill tone-${statusTone(offer.status)}`}>{statusLabel(offer.status)}</span>
+                          {['submitted', 'updated'].includes(offer.status) ? (
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-success shipment-offer-accept-btn"
+                              disabled={Boolean(actionLoadingId)}
+                              onClick={() => void handleOfferAction(offer._id, 'accept')}
+                            >
+                              {actionLoadingId === offer._id ? 'İşleniyor...' : 'Kabul Et'}
+                            </button>
+                          ) : (
+                            <span className="text-secondary small">İşlem yok</span>
+                          )}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           ) : null}
 
@@ -1002,62 +2081,127 @@ export function ShipmentDetailPage() {
             <div className="panel-card p-4 mb-3 offer-editor-premium">
               <div className="offer-editor-head d-flex justify-content-between align-items-center gap-3 flex-wrap mb-3">
                 <div>
-                  <strong>{sentOffers.length ? 'Teklifini Güncelle' : 'Bu Yüke Teklif Ver'}</strong>
-                  <small>Taşıyıcı olarak bu yüke teklif verebilir, istersen güncelleyebilirsin.</small>
+                  <span className="offer-editor-kicker">
+                    <i className="bi bi-stars me-1"></i>
+                    Teklif Paneli
+                  </span>
+                  <strong>{canCarrierEditOffer ? (sentOffers.length ? 'Teklifini Güncelle' : 'Bu Yüke Teklif Ver') : 'Teklif İşlemleri Kilitli'}</strong>
+                  <small>
+                    {canCarrierEditOffer
+                      ? 'Taşıyıcı olarak bu yüke teklif verebilir, istersen güncelleyebilirsin.'
+                      : 'Bu ilan durumunda teklif işlemleri geçici olarak kapalıdır.'}
+                  </small>
                 </div>
               </div>
-              <div className="row g-3">
+              {carrierOfferLockReason ? (
+                <div className="alert alert-warning border py-2 px-3 mb-3">
+                  {carrierOfferLockReason}
+                </div>
+              ) : null}
+              <div className="row g-3 offer-editor-grid">
                 <div className="col-md-4">
-                  <label className="form-label">Araç</label>
-                  <select
-                    className="form-select"
-                    value={carrierOfferDraft.vehicleId}
-                    onChange={(e) => setCarrierOfferDraft((prev) => ({ ...prev, vehicleId: e.target.value }))}
-                  >
-                    <option value="">Araç seçin</option>
-                    {carrierVehicles.map((v) => (
-                      <option key={v._id} value={v._id}>
-                        {`${v.plateMasked || '-'} ${v.brand || ''} ${v.model || ''}`.trim()}
-                      </option>
-                    ))}
-                  </select>
+                  <div className="offer-editor-field">
+                    <label className="form-label"><i className="bi bi-truck me-1"></i>Araç</label>
+                    <select
+                      className="form-select"
+                      value={carrierOfferDraft.vehicleId}
+                      onChange={(e) => setCarrierOfferDraft((prev) => ({ ...prev, vehicleId: e.target.value }))}
+                      disabled={!canCarrierEditOffer}
+                    >
+                      <option value="">Araç seçin</option>
+                      {suitableCarrierVehicles.map((v) => (
+                        <option key={v._id} value={v._id}>
+                          {`${v.plateMasked || '-'} ${v.brand || ''} ${v.model || ''}`.trim()}
+                        </option>
+                      ))}
+                    </select>
+                    {singleSuitableVehicle ? (
+                      <div className="offer-editor-vehicle-hint">
+                        <i className="bi bi-check-circle-fill"></i>
+                        <span>Uygun araç otomatik seçildi: <strong>{singleSuitableVehicle.plateMasked || '-'}</strong></span>
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="col-md-4">
-                  <label className="form-label">Teklif Tutarı (₺)</label>
-                  <input
-                    className="form-control"
-                    type="number"
-                    min={1}
-                    value={carrierOfferDraft.amount}
-                    onChange={(e) => setCarrierOfferDraft((prev) => ({ ...prev, amount: e.target.value }))}
-                    placeholder="Örn: 4500"
-                  />
+                  <div className="offer-editor-field">
+                    <label className="form-label"><i className="bi bi-cash-coin me-1"></i>Teklif Tutarı (₺)</label>
+                    <input
+                      className="form-control"
+                      type="text"
+                      inputMode="numeric"
+                      value={carrierOfferDraft.amount}
+                      onChange={(e) =>
+                        setCarrierOfferDraft((prev) => ({
+                          ...prev,
+                          amount: formatCurrencyInput(e.target.value),
+                        }))
+                      }
+                      placeholder="Örn: 50.000"
+                      disabled={!canCarrierEditOffer}
+                    />
+                  </div>
                 </div>
                 <div className="col-md-4">
-                  <label className="form-label">Not (Opsiyonel)</label>
-                  <input
-                    className="form-control"
-                    value={carrierOfferDraft.note}
-                    onChange={(e) => setCarrierOfferDraft((prev) => ({ ...prev, note: e.target.value }))}
-                    placeholder="Kısa açıklama"
-                  />
+                  <div className="offer-editor-field">
+                    <label className="form-label"><i className="bi bi-pencil-square me-1"></i>Not (Opsiyonel)</label>
+                    <input
+                      className="form-control"
+                      value={carrierOfferDraft.note}
+                      onChange={(e) => setCarrierOfferDraft((prev) => ({ ...prev, note: e.target.value }))}
+                      placeholder="Kısa açıklama"
+                      disabled={!canCarrierEditOffer}
+                    />
+                  </div>
                 </div>
               </div>
-              <div className="d-flex gap-2 mt-3">
-                <button type="button" className="btn btn-primary" disabled={carrierOfferLoading} onClick={() => void handleCarrierOfferSubmit()}>
-                  {carrierOfferLoading ? 'Kaydediliyor...' : sentOffers.length ? 'Teklifi Güncelle' : 'Teklif Ver'}
-                </button>
-                {sentOffers[0] && ['submitted', 'updated'].includes(sentOffers[0].status) ? (
+              {carrierOfferContractRequired && canCarrierEditOffer ? (
+                <div className="mt-3 offer-editor-contract-row">
+                  <label className="offer-editor-contract-check" htmlFor="carrier-offer-contract-ack">
+                    <input
+                      id="carrier-offer-contract-ack"
+                      className="offer-editor-contract-input"
+                      type="checkbox"
+                      checked={carrierOfferContractAccepted}
+                      onChange={(e) => setCarrierOfferContractAccepted(e.target.checked)}
+                      disabled={!canCarrierEditOffer}
+                    />
+                    <span className="offer-editor-contract-label">{carrierOfferContractCheckboxLabel}</span>
+                  </label>
+                  <div className="offer-editor-contract-actions">
+                    <button type="button" className="btn btn-link btn-sm p-0" onClick={() => void openCarrierOfferContractLightbox()}>
+                      Belgeyi Oku
+                    </button>
+                    {carrierOfferContractSlug ? (
+                      <button type="button" className="btn btn-link btn-sm p-0 ms-2" onClick={() => downloadCarrierOfferContractPdf()}>
+                        PDF Olarak İndir
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              {canCarrierEditOffer ? (
+                <div className="d-flex gap-2 mt-3 offer-editor-actions">
                   <button
                     type="button"
-                    className="btn btn-outline-danger"
-                    disabled={carrierOfferLoading}
-                    onClick={() => void handleCarrierWithdraw(sentOffers[0]._id)}
+                    className="btn btn-primary offer-editor-submit-btn"
+                    disabled={carrierOfferLoading || (carrierOfferContractRequired && !carrierOfferContractAccepted)}
+                    onClick={() => void handleCarrierOfferSubmit()}
                   >
-                    Teklifi Geri Çek
+                    {carrierOfferLoading ? 'Kaydediliyor...' : sentOffers.length ? 'Teklifi Güncelle' : 'Teklif Ver'}
                   </button>
-                ) : null}
-              </div>
+                  {canCarrierWithdrawOffer && activeCarrierOffer ? (
+                    <button
+                      type="button"
+                      className="btn btn-outline-danger offer-editor-cancel-btn"
+                      disabled={carrierOfferLoading}
+                      onClick={() => void handleCarrierWithdraw(activeCarrierOffer._id)}
+                    >
+                      Teklifi Geri Çek
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -1187,6 +2331,7 @@ const parseDescription = (raw?: string) => {
   return {
     summary: picked['aciklama'] || remaining[0] || '',
     note: picked['not'] || '',
+    cargoType: picked['yük tipi'] || picked['yuk tipi'] || '',
     loadType: picked['yük yapisi'] || picked['yuk yapisi'] || '',
     pickupAddress: picked['çıkış adresi'] || picked['cikis adresi'] || '',
     dropoffAddress: picked['varış adresi'] || picked['varis adresi'] || '',

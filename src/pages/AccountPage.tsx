@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useSearchParams } from 'react-router-dom';
 import Swal from 'sweetalert2';
 import { MediaLightbox } from '../components/MediaLightbox';
+import { NearbyLoadsMapPanel } from '../components/NearbyLoadsMapPanel';
 import { api, toAbsoluteAssetUrl } from '../lib/api';
 
 type UserProfile = {
@@ -13,6 +14,11 @@ type UserProfile = {
   email?: string;
   role: 'shipper' | 'carrier' | 'admin';
   personType?: 'individual' | 'sole_proprietor' | 'corporate';
+  companyName?: string;
+  companyTitle?: string;
+  taxNumber?: string;
+  authorizedPersonName?: string;
+  billingAddress?: string;
   membershipStatus: string;
   workingModes?: Array<'intracity' | 'intercity'>;
   city?: string;
@@ -74,11 +80,21 @@ type CarrierFeedShipment = {
   _id: string;
   title: string;
   status: string;
+  description?: string;
   transportMode: 'intracity' | 'intercity';
+  pickupGeo?: { type?: 'Point'; coordinates?: [number, number] | number[] };
   pickupCity?: string;
   pickupDistrict?: string;
   dropoffCity?: string;
   dropoffDistrict?: string;
+  routeDistanceKm?: number;
+  routeDurationMin?: number;
+  scheduledPickupAt?: string;
+  estimatedWeightKg?: number;
+  estimatedVolumeM3?: number;
+  pieceCount?: number;
+  isUrgent?: boolean;
+  createdAt?: string;
   hasMyOffer?: boolean;
   myOfferStatus?: string;
   myOfferPrice?: number;
@@ -89,8 +105,38 @@ type CarrierOffer = {
   status: string;
   price?: number;
   createdAt?: string;
-  shipmentId?: { _id?: string; title?: string; transportMode?: 'intracity' | 'intercity'; pickupCity?: string; dropoffCity?: string };
+  shipmentId?: {
+    _id?: string;
+    title?: string;
+    status?: string;
+    transportMode?: 'intracity' | 'intercity';
+    pickupCity?: string;
+    dropoffCity?: string;
+  };
   vehicleId?: { _id?: string; plateMasked?: string; brand?: string; model?: string };
+};
+type ReviewShipmentStatusRow = {
+  shipmentId: string;
+  status: string;
+  hasMyReview: boolean;
+  hasReceivedReview: boolean;
+  canReview: boolean;
+  shouldPromptReciprocal: boolean;
+};
+type ReceivedReviewRow = {
+  _id: string;
+  rating?: number;
+  comment?: string;
+  createdAt?: string;
+  reviewerUserId?: { _id?: string; fullName?: string; role?: string } | string;
+  shipmentId?: { _id?: string; title?: string; status?: string } | string;
+};
+type ReceivedReviewResponse = {
+  summary?: {
+    count?: number;
+    avg?: number;
+  };
+  rows?: ReceivedReviewRow[];
 };
 type MyVehicle = {
   _id: string;
@@ -107,6 +153,17 @@ type MyDocument = {
   fileUrl?: string;
   status: string;
   createdAt?: string;
+};
+type CarrierLoadAlert = {
+  _id: string;
+  name: string;
+  transportMode: 'all' | 'intracity' | 'intercity';
+  city?: string;
+  district?: string;
+  loadTypeSlug?: string;
+  isActive: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 type SubscriptionPurchase = {
@@ -125,17 +182,32 @@ export function AccountPage() {
   const [message, setMessage] = useState('');
   const [saveMessage, setSaveMessage] = useState('');
   const [saving, setSaving] = useState(false);
-  const [activePanel, setActivePanel] = useState<'overview' | 'profile' | 'shipments' | 'feed' | 'offers' | 'vehicle_add' | 'vehicle_list' | 'vehicle_docs'>('overview');
+  const [activePanel, setActivePanel] = useState<'overview' | 'profile' | 'reviews' | 'shipments' | 'nearby_map' | 'offers' | 'completed_loads' | 'load_alerts' | 'subscriptions' | 'vehicle_add' | 'vehicle_list' | 'vehicle_docs'>('overview');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [data, setData] = useState<ShipmentsDetailedResponse | null>(null);
   const [carrierFeed, setCarrierFeed] = useState<CarrierFeedShipment[]>([]);
   const [carrierOffers, setCarrierOffers] = useState<CarrierOffer[]>([]);
+  const [reviewStatusByShipmentId, setReviewStatusByShipmentId] = useState<Record<string, ReviewShipmentStatusRow>>({});
+  const [receivedReviews, setReceivedReviews] = useState<ReceivedReviewRow[]>([]);
+  const [receivedReviewSummary, setReceivedReviewSummary] = useState<{ count: number; avg: number }>({ count: 0, avg: 0 });
+  const [receivedReviewSort, setReceivedReviewSort] = useState<'newest' | 'oldest' | 'rating_high' | 'rating_low' | 'commented_first'>('newest');
   const [carrierOfferTab, setCarrierOfferTab] = useState<'all' | 'pending' | 'accepted' | 'rejected' | 'withdrawn' | 'other'>('all');
-  const [shipperShipmentTab, setShipperShipmentTab] = useState<'all' | 'published' | 'offer_collecting' | 'matched' | 'completed' | 'cancelled' | 'other'>('all');
+  const [carrierOfferSort, setCarrierOfferSort] = useState<'newest' | 'oldest' | 'price_high' | 'price_low' | 'status'>('newest');
+  const [carrierCompletedSort, setCarrierCompletedSort] = useState<'newest' | 'oldest' | 'price_high' | 'price_low' | 'title'>('newest');
+  const [shipperShipmentTab, setShipperShipmentTab] = useState<'all' | 'open_pool' | 'matched' | 'completed' | 'expired' | 'cancelled' | 'other'>('all');
+  const [shipperShipmentSort, setShipperShipmentSort] = useState<'newest' | 'oldest' | 'offers_high' | 'offers_low' | 'title'>('newest');
+  const [carrierAlerts, setCarrierAlerts] = useState<CarrierLoadAlert[]>([]);
+  const [alertActionLoading, setAlertActionLoading] = useState('');
+  const [alertEditId, setAlertEditId] = useState('');
+  const [alertName, setAlertName] = useState('');
+  const [alertMode, setAlertMode] = useState<'all' | 'intracity' | 'intercity'>('all');
+  const [alertCityId, setAlertCityId] = useState('');
+  const [alertDistrict, setAlertDistrict] = useState('');
+  const [alertLoadTypeSlug, setAlertLoadTypeSlug] = useState('');
   const [myVehicles, setMyVehicles] = useState<MyVehicle[]>([]);
-  const [offerDraft, setOfferDraft] = useState<Record<string, { vehicleId: string; amount: string; note: string }>>({});
   const [offerActionLoading, setOfferActionLoading] = useState('');
+  const [shipmentActionLoading, setShipmentActionLoading] = useState('');
   const [cities, setCities] = useState<CityOption[]>([]);
   const [districtByCity, setDistrictByCity] = useState<Record<string, DistrictOption[]>>({});
   const [selectedCityId, setSelectedCityId] = useState('');
@@ -169,10 +241,16 @@ export function AccountPage() {
   const [editFullName, setEditFullName] = useState('');
   const [editPersonType, setEditPersonType] = useState<UserProfile['personType']>('individual');
   const [editWorkingModes, setEditWorkingModes] = useState<Array<'intracity' | 'intercity'>>([]);
+  const [editCompanyName, setEditCompanyName] = useState('');
+  const [editCompanyTitle, setEditCompanyTitle] = useState('');
+  const [editTaxNumber, setEditTaxNumber] = useState('');
+  const [editAuthorizedPersonName, setEditAuthorizedPersonName] = useState('');
+  const [editBillingAddress, setEditBillingAddress] = useState('');
 
   const token = localStorage.getItem('an_user_token');
   const panelParam = searchParams.get('panel');
   const vehicleIdParam = searchParams.get('vehicleId');
+  const shipperTabParam = searchParams.get('shipperTab');
 
   const modeLabel = (mode?: 'intracity' | 'intercity') =>
     mode === 'intercity' ? 'Şehirler Arasi' : 'Şehir Ici';
@@ -190,6 +268,116 @@ export function AccountPage() {
     return map[status || ''] || status || '-';
   };
 
+  const shipmentStatusBadgeLabel = (status?: string) => {
+    if (status === 'published' || status === 'offer_collecting') return 'Yayinda · Teklif Topluyor';
+    return shipmentStatusLabel(status);
+  };
+
+  const shipmentStatusPillTone = (status?: string) => {
+    if (status === 'published' || status === 'offer_collecting') return 'tone-info';
+    if (status === 'matched') return 'tone-success';
+    if (status === 'completed') return 'tone-warning';
+    if (status === 'cancelled') return 'tone-danger';
+    return 'tone-neutral';
+  };
+  const isExpiredUnassignedShipment = (shipment?: ShipmentRow) => {
+    if (!shipment) return false;
+    if (!['published', 'offer_collecting'].includes(shipment.status)) return false;
+    if (!shipment.scheduledPickupAt) return false;
+    return new Date(shipment.scheduledPickupAt).getTime() < Date.now();
+  };
+  const shipmentListStatusLabel = (shipment?: ShipmentRow) =>
+    isExpiredUnassignedShipment(shipment) ? 'Süresi Geçti' : shipmentStatusBadgeLabel(shipment?.status);
+  const shipmentListStatusTone = (shipment?: ShipmentRow) =>
+    isExpiredUnassignedShipment(shipment) ? 'tone-danger' : shipmentStatusPillTone(shipment?.status);
+
+  const offerStatusLabel = (status?: string) => {
+    const map: Record<string, string> = {
+      submitted: 'Gonderildi',
+      updated: 'Guncellendi',
+      accepted: 'Kabul Edildi',
+      rejected: 'Reddedildi',
+      withdrawn: 'Geri Cekildi',
+      cancelled: 'Iptal',
+      expired: 'Suresi Doldu',
+    };
+    return map[status || ''] || status || '-';
+  };
+
+  const offerStatusPillTone = (status?: string) => {
+    if (['accepted'].includes(status || '')) return 'tone-success';
+    if (['rejected', 'cancelled', 'withdrawn', 'expired'].includes(status || '')) return 'tone-danger';
+    if (['submitted', 'updated'].includes(status || '')) return 'tone-warning';
+    return 'tone-neutral';
+  };
+  const roleLabel = (role?: string) => {
+    if (role === 'shipper') return 'Gönderici';
+    if (role === 'carrier') return 'Taşıyıcı';
+    if (role === 'admin') return 'Yönetici';
+    return '-';
+  };
+
+  const vehicleStatusLabel = (status?: string) => {
+    const map: Record<string, string> = {
+      active: 'Aktif',
+      pending_review: 'Incelemede',
+      suspended: 'Askida',
+      rejected: 'Reddedildi',
+      passive: 'Pasif',
+      inactive: 'Pasif',
+    };
+    return map[status || ''] || status || '-';
+  };
+
+  const vehicleStatusPillTone = (status?: string) => {
+    if (status === 'active') return 'tone-success';
+    if (['pending_review'].includes(status || '')) return 'tone-warning';
+    if (['rejected', 'suspended'].includes(status || '')) return 'tone-danger';
+    return 'tone-neutral';
+  };
+
+  const vehicleDocumentTypeLabel = (documentType?: string) => {
+    const map: Record<string, string> = {
+      vehicle_registration: 'Ruhsat',
+      k1: 'K1 Yetki Belgesi',
+      k3: 'K3 Yetki Belgesi',
+      src4: 'SRC4 Belgesi',
+      psychotechnic: 'Psikoteknik',
+      vehicle_front_photo: 'Araç Ön Fotoğrafı',
+      vehicle_plate_photo: 'Plaka Fotoğrafı',
+      other_vehicle_document: 'Diğer Araç Belgesi',
+    };
+    return map[documentType || ''] || documentType || '-';
+  };
+
+  const vehicleDocumentStatusLabel = (status?: string) => {
+    const map: Record<string, string> = {
+      pending: 'Beklemede',
+      pending_review: 'Incelemede',
+      approved: 'Onaylandi',
+      rejected: 'Reddedildi',
+      revision_required: 'Revizyon Gerekli',
+      expired: 'Suresi Doldu',
+    };
+    return map[status || ''] || status || '-';
+  };
+
+  const vehicleDocumentStatusPillTone = (status?: string) => {
+    if (status === 'approved') return 'tone-success';
+    if (['pending', 'pending_review'].includes(status || '')) return 'tone-warning';
+    if (['rejected', 'revision_required', 'expired'].includes(status || '')) return 'tone-danger';
+    return 'tone-neutral';
+  };
+
+  const formatTryPrice = (value?: number) => {
+    if (typeof value !== 'number' || Number.isNaN(value)) return '-';
+    return new Intl.NumberFormat('tr-TR', {
+      style: 'currency',
+      currency: 'TRY',
+      maximumFractionDigits: 0,
+    }).format(value);
+  };
+
   const notifyError = (text: string) => {
     void Swal.fire({ icon: 'error', title: 'Hata', text, confirmButtonText: 'Tamam' });
   };
@@ -204,6 +392,12 @@ export function AccountPage() {
 
   const districtOptions = useMemo(() => districtByCity[selectedCityId] || [], [districtByCity, selectedCityId]);
   const vehicleDistrictOptions = useMemo(() => districtByCity[vehicleServiceCityId] || [], [districtByCity, vehicleServiceCityId]);
+  const alertDistrictOptions = useMemo(() => districtByCity[alertCityId] || [], [districtByCity, alertCityId]);
+  const alertCityName = useMemo(() => cities.find((x) => x.id === alertCityId)?.name || '', [cities, alertCityId]);
+  const loadTypeLabelMap = useMemo(
+    () => loadTypeOptions.reduce((acc, item) => ({ ...acc, [item.key]: item.label }), {} as Record<string, string>),
+    [loadTypeOptions],
+  );
   const selectedVehicleType = useMemo(
     () => vehicleTypeOptions.find((x) => x.key === vehicleTypeSlug) || null,
     [vehicleTypeOptions, vehicleTypeSlug],
@@ -246,51 +440,104 @@ export function AccountPage() {
         setEditFullName(nextProfile.fullName || '');
         setEditPersonType((nextProfile.personType || 'individual') as UserProfile['personType']);
         setEditWorkingModes(nextProfile.workingModes || []);
+        setEditCompanyName(nextProfile.companyName || '');
+        setEditCompanyTitle(nextProfile.companyTitle || '');
+        setEditTaxNumber(nextProfile.taxNumber || '');
+        setEditAuthorizedPersonName(nextProfile.authorizedPersonName || '');
+        setEditBillingAddress(nextProfile.billingAddress || '');
 
         const foundCity = nextCities.find((c) => c.name === (nextProfile.city || ''));
         if (foundCity) {
           setSelectedCityId(foundCity.id);
-          await loadDistricts(foundCity.id);
+          void loadDistricts(foundCity.id);
           setSelectedDistrictName(nextProfile.district || '');
         } else {
           setSelectedCityId('');
           setSelectedDistrictName('');
         }
 
+        // İlk ekranı hızlı aç: role'e özel ağır istekleri arka planda yükle.
+        setLoading(false);
+
         if (nextProfile.role === 'shipper') {
-          const shipmentsRes = await api.get<ShipmentsDetailedResponse>('/shipments/my/detailed');
-          setData(shipmentsRes.data);
           setCarrierFeed([]);
           setCarrierOffers([]);
+          setCarrierAlerts([]);
           setMyVehicles([]);
           setMyDocuments([]);
+          setSubscriptionPurchases([]);
+          void (async () => {
+            try {
+              const [shipmentsRes, receivedReviewsRes] = await Promise.all([
+                api.get<ShipmentsDetailedResponse>('/shipments/my/detailed'),
+                api.get<ReceivedReviewResponse>('/reviews/me/received'),
+              ]);
+              setData(shipmentsRes.data);
+              setReceivedReviews(Array.isArray(receivedReviewsRes.data?.rows) ? receivedReviewsRes.data?.rows || [] : []);
+              setReceivedReviewSummary({
+                count: Number(receivedReviewsRes.data?.summary?.count || 0),
+                avg: Number(receivedReviewsRes.data?.summary?.avg || 0),
+              });
+              const shipmentIds = (shipmentsRes.data?.rows || []).map((row) => row._id);
+              await loadReviewStatuses(shipmentIds);
+            } catch {
+              // ilk açılışı bloklamamak için sessiz geç
+              setReviewStatusByShipmentId({});
+              setReceivedReviews([]);
+              setReceivedReviewSummary({ count: 0, avg: 0 });
+            }
+          })();
         } else if (nextProfile.role === 'carrier') {
-          const [feedRes, offersRes, vehiclesRes, docsRes, subRes] = await Promise.all([
-            api.get<CarrierFeedShipment[]>('/shipments/feed'),
-            api.get<CarrierOffer[]>('/offers/my/detailed'),
-            api.get<MyVehicle[]>('/vehicles/my'),
-            api.get<MyDocument[]>('/documents/my'),
-            api.get<{ purchases?: SubscriptionPurchase[] }>('/carrier-subscriptions/me'),
-          ]);
-          setCarrierFeed(Array.isArray(feedRes.data) ? feedRes.data : []);
-          setCarrierOffers(Array.isArray(offersRes.data) ? offersRes.data : []);
-          setMyVehicles(Array.isArray(vehiclesRes.data) ? vehiclesRes.data : []);
-          setMyDocuments(Array.isArray(docsRes.data) ? docsRes.data : []);
-          setSubscriptionPurchases(Array.isArray(subRes.data?.purchases) ? subRes.data.purchases : []);
           setData(null);
+          void (async () => {
+            try {
+              const [feedRes, offersRes, vehiclesRes, docsRes, subRes, receivedReviewsRes, alertsRes] = await Promise.all([
+                api.get<CarrierFeedShipment[]>('/shipments/feed'),
+                api.get<CarrierOffer[]>('/offers/my/detailed'),
+                api.get<MyVehicle[]>('/vehicles/my'),
+                api.get<MyDocument[]>('/documents/my'),
+                api.get<{ purchases?: SubscriptionPurchase[] }>('/carrier-subscriptions/me'),
+                api.get<ReceivedReviewResponse>('/reviews/me/received'),
+                api.get<CarrierLoadAlert[]>('/carrier-load-alerts/my'),
+              ]);
+              setCarrierFeed(Array.isArray(feedRes.data) ? feedRes.data : []);
+              setCarrierOffers(Array.isArray(offersRes.data) ? offersRes.data : []);
+              setCarrierAlerts(Array.isArray(alertsRes.data) ? alertsRes.data : []);
+              setMyVehicles(Array.isArray(vehiclesRes.data) ? vehiclesRes.data : []);
+              setMyDocuments(Array.isArray(docsRes.data) ? docsRes.data : []);
+              setSubscriptionPurchases(Array.isArray(subRes.data?.purchases) ? subRes.data.purchases : []);
+              setReceivedReviews(Array.isArray(receivedReviewsRes.data?.rows) ? receivedReviewsRes.data?.rows || [] : []);
+              setReceivedReviewSummary({
+                count: Number(receivedReviewsRes.data?.summary?.count || 0),
+                avg: Number(receivedReviewsRes.data?.summary?.avg || 0),
+              });
+              const shipmentIds = (Array.isArray(offersRes.data) ? offersRes.data : [])
+                .map((offer) => String(offer?.shipmentId?._id || ''))
+                .filter(Boolean);
+              await loadReviewStatuses(shipmentIds);
+            } catch {
+              // ilk açılışı bloklamamak için sessiz geç
+              setReviewStatusByShipmentId({});
+              setReceivedReviews([]);
+              setReceivedReviewSummary({ count: 0, avg: 0 });
+            }
+          })();
         } else {
           setData(null);
           setCarrierFeed([]);
           setCarrierOffers([]);
+          setCarrierAlerts([]);
           setMyVehicles([]);
           setMyDocuments([]);
           setSubscriptionPurchases([]);
+          setReviewStatusByShipmentId({});
+          setReceivedReviews([]);
+          setReceivedReviewSummary({ count: 0, avg: 0 });
         }
       } catch (error: any) {
         const errText = error?.response?.data?.message || 'Hesap verileri yüklenemedi.';
         setMessage(errText);
         notifyError(errText);
-      } finally {
         setLoading(false);
       }
     };
@@ -315,6 +562,14 @@ export function AccountPage() {
     void loadDistricts(vehicleServiceCityId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vehicleServiceCityId]);
+  useEffect(() => {
+    if (!alertCityId) {
+      setAlertDistrict('');
+      return;
+    }
+    void loadDistricts(alertCityId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alertCityId]);
 
   useEffect(() => {
     if (!selectedVehicleType) return;
@@ -348,17 +603,25 @@ export function AccountPage() {
     if (!profile) return;
     if (!panelParam) return;
 
-    const carrierPanels = new Set(['overview', 'profile', 'feed', 'offers', 'vehicle_add', 'vehicle_list', 'vehicle_docs']);
-    const shipperPanels = new Set(['overview', 'profile', 'shipments']);
+    const carrierPanels = new Set(['overview', 'profile', 'reviews', 'nearby_map', 'offers', 'completed_loads', 'load_alerts', 'subscriptions', 'vehicle_add', 'vehicle_list', 'vehicle_docs']);
+    const shipperPanels = new Set(['overview', 'profile', 'reviews', 'shipments']);
 
     if (profile.role === 'carrier' && carrierPanels.has(panelParam)) {
-      setActivePanel(panelParam as 'overview' | 'profile' | 'feed' | 'offers' | 'vehicle_add' | 'vehicle_list' | 'vehicle_docs');
+      setActivePanel(panelParam as 'overview' | 'profile' | 'reviews' | 'nearby_map' | 'offers' | 'completed_loads' | 'load_alerts' | 'subscriptions' | 'vehicle_add' | 'vehicle_list' | 'vehicle_docs');
       return;
     }
     if (profile.role === 'shipper' && shipperPanels.has(panelParam)) {
-      setActivePanel(panelParam as 'overview' | 'profile' | 'shipments');
+      setActivePanel(panelParam as 'overview' | 'profile' | 'reviews' | 'shipments');
+      if (panelParam === 'shipments' && shipperTabParam) {
+        const allowed = new Set(['all', 'open_pool', 'matched', 'completed', 'expired', 'cancelled', 'other']);
+        if (allowed.has(shipperTabParam)) {
+          setShipperShipmentTab(
+            shipperTabParam as 'all' | 'open_pool' | 'matched' | 'completed' | 'expired' | 'cancelled' | 'other',
+          );
+        }
+      }
     }
-  }, [panelParam, profile]);
+  }, [panelParam, profile, shipperTabParam]);
 
   const saveProfile = async () => {
     if (!profile) return;
@@ -376,6 +639,11 @@ export function AccountPage() {
         personType: editPersonType || 'individual',
         city: cityName || undefined,
         district: selectedDistrictName || undefined,
+        companyName: editCompanyName.trim() || undefined,
+        companyTitle: editCompanyTitle.trim() || undefined,
+        taxNumber: editTaxNumber.trim() || undefined,
+        authorizedPersonName: editAuthorizedPersonName.trim() || undefined,
+        billingAddress: editBillingAddress.trim() || undefined,
       };
       if (profile.role === 'carrier') payload.workingModes = editWorkingModes;
 
@@ -396,8 +664,6 @@ export function AccountPage() {
 
   const latestShipments = useMemo(() => (data?.rows || []).slice(0, 20), [data?.rows]);
   const activeVehicles = useMemo(() => myVehicles.filter((v) => v.status === 'active'), [myVehicles]);
-  const offeredInFeed = useMemo(() => carrierFeed.filter((x) => x.hasMyOffer), [carrierFeed]);
-  const openFeed = useMemo(() => carrierFeed.filter((x) => !x.hasMyOffer), [carrierFeed]);
   const filteredCarrierOffers = useMemo(() => {
     if (carrierOfferTab === 'all') return carrierOffers;
     if (carrierOfferTab === 'pending') return carrierOffers.filter((x) => ['submitted', 'updated'].includes(x.status));
@@ -406,31 +672,172 @@ export function AccountPage() {
     if (carrierOfferTab === 'withdrawn') return carrierOffers.filter((x) => x.status === 'withdrawn');
     return carrierOffers.filter((x) => ['cancelled', 'expired'].includes(x.status));
   }, [carrierOffers, carrierOfferTab]);
+  const sortedCarrierOffers = useMemo(() => {
+    const rows = [...filteredCarrierOffers];
+    if (carrierOfferSort === 'newest') {
+      rows.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return rows;
+    }
+    if (carrierOfferSort === 'oldest') {
+      rows.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
+      return rows;
+    }
+    if (carrierOfferSort === 'price_high') {
+      rows.sort((a, b) => Number(b.price || 0) - Number(a.price || 0));
+      return rows;
+    }
+    if (carrierOfferSort === 'price_low') {
+      rows.sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
+      return rows;
+    }
+    rows.sort((a, b) => offerStatusLabel(a.status).localeCompare(offerStatusLabel(b.status), 'tr'));
+    return rows;
+  }, [filteredCarrierOffers, carrierOfferSort]);
+  const carrierCompletedOffers = useMemo(() => {
+    const acceptedCompleted = carrierOffers.filter(
+      (offer) => offer.status === 'accepted' && offer.shipmentId?._id && offer.shipmentId?.status === 'completed',
+    );
+    const byShipment: Record<string, CarrierOffer> = {};
+    acceptedCompleted.forEach((offer) => {
+      const shipmentId = String(offer.shipmentId?._id || '');
+      if (!shipmentId) return;
+      const current = byShipment[shipmentId];
+      if (!current) {
+        byShipment[shipmentId] = offer;
+        return;
+      }
+      const currentTs = new Date(current.createdAt || 0).getTime();
+      const nextTs = new Date(offer.createdAt || 0).getTime();
+      if (nextTs > currentTs) byShipment[shipmentId] = offer;
+    });
+    return Object.values(byShipment);
+  }, [carrierOffers]);
+  const sortedCarrierCompletedOffers = useMemo(() => {
+    const rows = [...carrierCompletedOffers];
+    if (carrierCompletedSort === 'newest') {
+      rows.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return rows;
+    }
+    if (carrierCompletedSort === 'oldest') {
+      rows.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
+      return rows;
+    }
+    if (carrierCompletedSort === 'price_high') {
+      rows.sort((a, b) => Number(b.price || 0) - Number(a.price || 0));
+      return rows;
+    }
+    if (carrierCompletedSort === 'price_low') {
+      rows.sort((a, b) => Number(a.price || 0) - Number(b.price || 0));
+      return rows;
+    }
+    rows.sort((a, b) => String(a.shipmentId?.title || '').localeCompare(String(b.shipmentId?.title || ''), 'tr'));
+    return rows;
+  }, [carrierCompletedOffers, carrierCompletedSort]);
   const filteredShipperShipments = useMemo(() => {
     if (shipperShipmentTab === 'all') return latestShipments;
+    if (shipperShipmentTab === 'open_pool') {
+      return latestShipments.filter((x) => ['published', 'offer_collecting'].includes(x.status) && !isExpiredUnassignedShipment(x));
+    }
+    if (shipperShipmentTab === 'expired') {
+      return latestShipments.filter((x) => isExpiredUnassignedShipment(x));
+    }
     if (shipperShipmentTab === 'other') {
       return latestShipments.filter((x) => !['published', 'offer_collecting', 'matched', 'completed', 'cancelled'].includes(x.status));
     }
     return latestShipments.filter((x) => x.status === shipperShipmentTab);
   }, [latestShipments, shipperShipmentTab]);
+  const sortedShipperShipments = useMemo(() => {
+    const rows = [...filteredShipperShipments];
+    if (shipperShipmentSort === 'newest') {
+      rows.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return rows;
+    }
+    if (shipperShipmentSort === 'oldest') {
+      rows.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
+      return rows;
+    }
+    if (shipperShipmentSort === 'offers_high') {
+      rows.sort((a, b) => Number(b.offerStats?.total || 0) - Number(a.offerStats?.total || 0));
+      return rows;
+    }
+    if (shipperShipmentSort === 'offers_low') {
+      rows.sort((a, b) => Number(a.offerStats?.total || 0) - Number(b.offerStats?.total || 0));
+      return rows;
+    }
+    rows.sort((a, b) => String(a.title || '').localeCompare(String(b.title || ''), 'tr'));
+    return rows;
+  }, [filteredShipperShipments, shipperShipmentSort]);
+  const sortedReceivedReviews = useMemo(() => {
+    const rows = [...receivedReviews];
+    if (receivedReviewSort === 'newest') {
+      rows.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return rows;
+    }
+    if (receivedReviewSort === 'oldest') {
+      rows.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
+      return rows;
+    }
+    if (receivedReviewSort === 'rating_high') {
+      rows.sort((a, b) => Number(b.rating || 0) - Number(a.rating || 0));
+      return rows;
+    }
+    if (receivedReviewSort === 'rating_low') {
+      rows.sort((a, b) => Number(a.rating || 0) - Number(b.rating || 0));
+      return rows;
+    }
+    rows.sort((a, b) => Number(Boolean(b.comment?.trim())) - Number(Boolean(a.comment?.trim())));
+    return rows;
+  }, [receivedReviews, receivedReviewSort]);
 
-  const getDefaultVehicleForShipment = (shipment: CarrierFeedShipment) => {
-    if (!activeVehicles.length) return '';
-    const toId = (value: unknown) => {
-      if (!value) return '';
-      if (typeof value === 'string') return value;
-      if (typeof value === 'object' && value !== null && '_id' in (value as Record<string, unknown>)) {
-        return String((value as { _id?: string })._id || '');
-      }
-      return '';
-    };
-    const recommendedIds = (shipment.recommendedVehicleTypeIds || []).map(toId).filter(Boolean);
-    if (!recommendedIds.length) return activeVehicles[0]?._id || '';
-    const matched = activeVehicles.find((v) => {
-      const vehicleTypeId = toId(v.vehicleTypeId as unknown);
-      return vehicleTypeId ? recommendedIds.includes(vehicleTypeId) : false;
+  const mapReviewStatuses = (rows: ReviewShipmentStatusRow[]) => {
+    const next: Record<string, ReviewShipmentStatusRow> = {};
+    (rows || []).forEach((row) => {
+      if (!row?.shipmentId) return;
+      next[row.shipmentId] = row;
     });
-    return matched?._id || activeVehicles[0]?._id || '';
+    setReviewStatusByShipmentId(next);
+  };
+
+  const loadReviewStatuses = async (shipmentIds: string[]) => {
+    const ids = Array.from(new Set((shipmentIds || []).filter(Boolean)));
+    if (!ids.length) {
+      setReviewStatusByShipmentId({});
+      return;
+    }
+    try {
+      const { data: reviewData } = await api.get<{ rows?: ReviewShipmentStatusRow[] }>('/reviews/me/shipments-status', {
+        params: { shipmentIds: ids.join(',') },
+      });
+      mapReviewStatuses(Array.isArray(reviewData?.rows) ? reviewData.rows : []);
+    } catch {
+      setReviewStatusByShipmentId({});
+    }
+  };
+
+  const getReviewBadge = (shipmentId?: string, shipmentStatus?: string) => {
+    if (!shipmentId || shipmentStatus !== 'completed') return null;
+    const info = reviewStatusByShipmentId[shipmentId];
+    if (!info) return null;
+    if (info.shouldPromptReciprocal) {
+      return <span className="badge text-bg-warning">Cevap bekleniyor</span>;
+    }
+    if (info.hasReceivedReview && !info.hasMyReview) {
+      return <span className="badge text-bg-success">Yeni yorum var</span>;
+    }
+    return null;
+  };
+  const loadReceivedReviews = async () => {
+    try {
+      const { data } = await api.get<ReceivedReviewResponse>('/reviews/me/received');
+      setReceivedReviews(Array.isArray(data?.rows) ? data.rows : []);
+      setReceivedReviewSummary({
+        count: Number(data?.summary?.count || 0),
+        avg: Number(data?.summary?.avg || 0),
+      });
+    } catch {
+      setReceivedReviews([]);
+      setReceivedReviewSummary({ count: 0, avg: 0 });
+    }
   };
 
   const refreshCarrierData = async () => {
@@ -444,34 +851,113 @@ export function AccountPage() {
     setCarrierOffers(Array.isArray(offersRes.data) ? offersRes.data : []);
     setMyVehicles(Array.isArray(vehiclesRes.data) ? vehiclesRes.data : []);
     setMyDocuments(Array.isArray(docsRes.data) ? docsRes.data : []);
+    const shipmentIds = (Array.isArray(offersRes.data) ? offersRes.data : [])
+      .map((offer) => String(offer?.shipmentId?._id || ''))
+      .filter(Boolean);
+    await loadReviewStatuses(shipmentIds);
+    await loadReceivedReviews();
+  };
+  const resetAlertForm = () => {
+    setAlertEditId('');
+    setAlertName('');
+    setAlertMode('all');
+    setAlertCityId('');
+    setAlertDistrict('');
+    setAlertLoadTypeSlug('');
   };
 
-  const submitOffer = async (shipmentId: string, fallbackVehicleId?: string) => {
-    const draft = offerDraft[shipmentId] || { vehicleId: fallbackVehicleId || '', amount: '', note: '' };
-    if (!draft?.vehicleId || !draft?.amount) {
-      setMessage('Teklif için arac ve tutar secimi zorunlu.');
-      notifyWarning('Teklif için araç ve tutar seçimi zorunlu.');
+  const startEditAlert = (alert: CarrierLoadAlert) => {
+    const matchedCityId =
+      cities.find(
+        (city) =>
+          (city.name || '').trim().toLocaleUpperCase('tr-TR') === (alert.city || '').trim().toLocaleUpperCase('tr-TR'),
+      )?.id || '';
+    setAlertEditId(alert._id);
+    setAlertName(alert.name || '');
+    setAlertMode(alert.transportMode || 'all');
+    setAlertCityId(matchedCityId);
+    setAlertDistrict(alert.district || '');
+    setAlertLoadTypeSlug(alert.loadTypeSlug || '');
+  };
+
+  const refreshCarrierAlerts = async () => {
+    const { data } = await api.get<CarrierLoadAlert[]>('/carrier-load-alerts/my');
+    setCarrierAlerts(Array.isArray(data) ? data : []);
+  };
+
+  const saveCarrierAlert = async () => {
+    if (!alertName.trim()) {
+      setMessage('Bildirim kuralı adı zorunlu.');
+      notifyWarning('Bildirim kuralı adı zorunlu.');
       return;
     }
-    setOfferActionLoading(shipmentId);
+    setAlertActionLoading('save');
     setMessage('');
     try {
-      await api.post('/offers', {
-        shipmentId,
-        vehicleId: draft.vehicleId,
-        amount: Number(draft.amount),
-        note: draft.note || undefined,
-      });
-      await refreshCarrierData();
-      setMessage('Teklif başarıyla gönderildi.');
-      notifySuccess('Teklif başarıyla gönderildi.');
+      const payload = {
+        name: alertName.trim(),
+        transportMode: alertMode,
+        city: alertCityName || undefined,
+        district: alertDistrict || undefined,
+        loadTypeSlug: alertLoadTypeSlug || undefined,
+        isActive: true,
+      };
+      if (alertEditId) {
+        await api.patch(`/carrier-load-alerts/${alertEditId}`, payload);
+      } else {
+        await api.post('/carrier-load-alerts', payload);
+      }
+      await refreshCarrierAlerts();
+      resetAlertForm();
+      notifySuccess(alertEditId ? 'Bildirim kuralı güncellendi.' : 'Bildirim kuralı kaydedildi.');
     } catch (error: any) {
-      const errText = error?.response?.data?.message || 'Teklif gönderilemedi.';
+      const errText = error?.response?.data?.message || 'Bildirim kurali kaydedilemedi.';
       setMessage(errText);
       notifyError(errText);
     } finally {
-      setOfferActionLoading('');
+      setAlertActionLoading('');
     }
+  };
+
+  const toggleCarrierAlert = async (alert: CarrierLoadAlert) => {
+    setAlertActionLoading(alert._id);
+    setMessage('');
+    try {
+      await api.patch(`/carrier-load-alerts/${alert._id}`, { isActive: !alert.isActive });
+      await refreshCarrierAlerts();
+      notifySuccess(`Bildirim ${alert.isActive ? 'pasif' : 'aktif'} edildi.`);
+    } catch (error: any) {
+      const errText = error?.response?.data?.message || 'Bildirim durumu degistirilemedi.';
+      setMessage(errText);
+      notifyError(errText);
+    } finally {
+      setAlertActionLoading('');
+    }
+  };
+
+  const deleteCarrierAlert = async (alertId: string) => {
+    setAlertActionLoading(alertId);
+    setMessage('');
+    try {
+      await api.delete(`/carrier-load-alerts/${alertId}`);
+      await refreshCarrierAlerts();
+      if (alertEditId === alertId) resetAlertForm();
+      notifySuccess('Bildirim kuralı silindi.');
+    } catch (error: any) {
+      const errText = error?.response?.data?.message || 'Bildirim kurali silinemedi.';
+      setMessage(errText);
+      notifyError(errText);
+    } finally {
+      setAlertActionLoading('');
+    }
+  };
+
+  const refreshShipperData = async () => {
+    const shipmentsRes = await api.get<ShipmentsDetailedResponse>('/shipments/my/detailed');
+    setData(shipmentsRes.data);
+    const shipmentIds = (shipmentsRes.data?.rows || []).map((row) => row._id);
+    await loadReviewStatuses(shipmentIds);
+    await loadReceivedReviews();
   };
 
   const withdrawOffer = async (offerId: string) => {
@@ -488,6 +974,34 @@ export function AccountPage() {
       notifyError(errText);
     } finally {
       setOfferActionLoading('');
+    }
+  };
+
+  const cancelShipment = async (shipmentId: string) => {
+    const ok = await Swal.fire({
+      icon: 'warning',
+      title: 'İlanı İptal Et',
+      text: 'Bu ilan iptal edilecek. Devam etmek istiyor musun?',
+      showCancelButton: true,
+      confirmButtonText: 'Evet, İptal Et',
+      cancelButtonText: 'Vazgeç',
+      reverseButtons: true,
+    });
+    if (!ok.isConfirmed) return;
+
+    setShipmentActionLoading(shipmentId);
+    setMessage('');
+    try {
+      await api.patch(`/shipments/${shipmentId}`, { status: 'cancelled' });
+      await refreshShipperData();
+      setMessage('Ilan iptal edildi.');
+      notifySuccess('İlan iptal edildi.');
+    } catch (error: any) {
+      const errText = error?.response?.data?.message || 'Ilan iptal edilemedi.';
+      setMessage(errText);
+      notifyError(errText);
+    } finally {
+      setShipmentActionLoading('');
     }
   };
 
@@ -630,7 +1144,7 @@ export function AccountPage() {
   };
 
   const switchPanel = (
-    panel: 'overview' | 'profile' | 'shipments' | 'feed' | 'offers' | 'vehicle_add' | 'vehicle_list' | 'vehicle_docs',
+    panel: 'overview' | 'profile' | 'reviews' | 'shipments' | 'nearby_map' | 'offers' | 'completed_loads' | 'load_alerts' | 'subscriptions' | 'vehicle_add' | 'vehicle_list' | 'vehicle_docs',
   ) => {
     setActivePanel(panel);
     setMobileSidebarOpen(false);
@@ -664,7 +1178,7 @@ export function AccountPage() {
         <h1 className="shipment-page-title mb-0">Hesabım</h1>
         <div className="d-flex gap-2">
           <Link to="/app" className="btn btn-outline-primary">
-            {profile?.role === 'carrier' ? 'Yük Havuzuna Git' : 'Yeni Yük Oluştur'}
+            {profile?.role === 'carrier' ? 'Yük İşlemleri' : 'Yeni Yük Oluştur'}
           </Link>
           {profile?.role === 'carrier' ? (
             <Link to="/hesabim?panel=vehicle_docs" className="btn btn-primary">
@@ -699,6 +1213,14 @@ export function AccountPage() {
               <div>
                 <strong>{profile?.fullName || 'Kullaniçi'}</strong>
                 <small>{profile?.membershipStatus || '-'}</small>
+                <div className="account-sidebar-rating mt-1">
+                  <span className="account-sidebar-rating-chip">
+                    <i className="bi bi-chat-left-text" /> {receivedReviewSummary.count} yorum
+                  </span>
+                  <span className="account-sidebar-rating-chip is-score">
+                    <i className="bi bi-star-fill" /> {receivedReviewSummary.count > 0 ? `${receivedReviewSummary.avg.toFixed(1)} puan` : 'Puan yok'}
+                  </span>
+                </div>
               </div>
             </div>
             <div className="account-menu">
@@ -729,10 +1251,38 @@ export function AccountPage() {
                 <>
                   <button
                     type="button"
-                    className={`account-menu-item ${activePanel === 'vehicle_add' ? 'is-active' : ''}`}
-                    onClick={() => switchPanel('vehicle_add')}
+                    className={`account-menu-item ${activePanel === 'offers' ? 'is-active' : ''}`}
+                    onClick={() => switchPanel('offers')}
                   >
-                    <i className="bi bi-plus-circle" /> Araç Ekle
+                    <i className="bi bi-receipt" /> Tekliflerim
+                  </button>
+                  <button
+                    type="button"
+                    className={`account-menu-item ${activePanel === 'completed_loads' ? 'is-active' : ''}`}
+                    onClick={() => switchPanel('completed_loads')}
+                  >
+                    <i className="bi bi-check2-circle" /> Tamamlanan Yükler
+                  </button>
+                  <button
+                    type="button"
+                    className={`account-menu-item ${activePanel === 'nearby_map' ? 'is-active' : ''}`}
+                    onClick={() => switchPanel('nearby_map')}
+                  >
+                    <i className="bi bi-geo-alt" /> Yakinimdaki Yukler
+                  </button>
+                  <button
+                    type="button"
+                    className={`account-menu-item ${activePanel === 'load_alerts' ? 'is-active' : ''}`}
+                    onClick={() => switchPanel('load_alerts')}
+                  >
+                    <i className="bi bi-bell" /> Yük Gelince Bildir
+                  </button>
+                  <button
+                    type="button"
+                    className={`account-menu-item ${activePanel === 'subscriptions' ? 'is-active' : ''}`}
+                    onClick={() => switchPanel('subscriptions')}
+                  >
+                    <i className="bi bi-credit-card-2-front" /> Abonelik Geçmişi
                   </button>
                   <button
                     type="button"
@@ -750,24 +1300,24 @@ export function AccountPage() {
                   </button>
                   <button
                     type="button"
-                    className={`account-menu-item ${activePanel === 'feed' ? 'is-active' : ''}`}
-                    onClick={() => switchPanel('feed')}
+                    className={`account-menu-item ${activePanel === 'vehicle_add' ? 'is-active' : ''}`}
+                    onClick={() => switchPanel('vehicle_add')}
                   >
-                    <i className="bi bi-search" /> Yük Havuzu
-                  </button>
-                  <button
-                    type="button"
-                    className={`account-menu-item ${activePanel === 'offers' ? 'is-active' : ''}`}
-                    onClick={() => switchPanel('offers')}
-                  >
-                    <i className="bi bi-receipt" /> Tekliflerim
+                    <i className="bi bi-plus-circle" /> Araç Ekle
                   </button>
                 </>
               ) : null}
+              <button
+                type="button"
+                className={`account-menu-item ${activePanel === 'reviews' ? 'is-active' : ''}`}
+                onClick={() => switchPanel('reviews')}
+              >
+                <i className="bi bi-star" /> Yorumlarim
+              </button>
             </div>
             <div className="account-sidebar-actions">
               <Link to="/app" className="btn btn-primary w-100">
-                {profile?.role === 'carrier' ? 'Yük Havuzuna Git' : 'Yeni Yük Oluştur'}
+                {profile?.role === 'carrier' ? 'Yük İşlemleri' : 'Yeni Yük Oluştur'}
               </Link>
               <button type="button" className="btn btn-outline-danger w-100 mt-2" onClick={handleLogout}>
                 Çıkış Yap
@@ -814,6 +1364,34 @@ export function AccountPage() {
                     <strong>{profile.role}</strong>
                   </div>
                 </div>
+
+                {(profile.personType === 'sole_proprietor' || profile.personType === 'corporate' || profile.companyName || profile.companyTitle) ? (
+                  <div className="mt-4 pt-3 border-top">
+                    <h6 className="fw-bold mb-3">Sirket Bilgileri</h6>
+                    <div className="row g-3">
+                      <div className="col-lg-4 col-md-6">
+                        <small>Sirket Adi</small>
+                        <strong>{profile.companyName || '-'}</strong>
+                      </div>
+                      <div className="col-lg-4 col-md-6">
+                        <small>Sirket Unvani</small>
+                        <strong>{profile.companyTitle || '-'}</strong>
+                      </div>
+                      <div className="col-lg-4 col-md-6">
+                        <small>Vergi Numarasi</small>
+                        <strong>{profile.taxNumber || '-'}</strong>
+                      </div>
+                      <div className="col-lg-4 col-md-6">
+                        <small>Yetkili Kisi</small>
+                        <strong>{profile.authorizedPersonName || '-'}</strong>
+                      </div>
+                      <div className="col-lg-8 col-md-12">
+                        <small>Fatura Adresi</small>
+                        <strong>{profile.billingAddress || '-'}</strong>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
               </div>
 
               {profile.role === 'shipper' ? (
@@ -872,104 +1450,134 @@ export function AccountPage() {
                 </div>
               ) : null}
 
-              {profile.role === 'carrier' ? (
-                <div className="panel-card p-3 mb-4">
-                  <div className="d-flex justify-content-between align-items-center mb-2">
-                    <h5 className="fw-bold mb-0">Abonelik Satin Alma Gecmisi</h5>
-                    <Link to="/abonelik/plan-1776496671427" className="btn btn-sm btn-outline-primary">
-                      Paketi Yukselt
-                    </Link>
-                  </div>
-                  {!subscriptionPurchases.length ? (
-                    <p className="text-secondary mb-0">Henuz satin alma kaydi yok.</p>
-                  ) : (
-                    <div className="table-responsive">
-                      <table className="table table-sm align-middle mb-0">
-                        <thead>
-                          <tr>
-                            <th>Paket</th>
-                            <th>Tutar</th>
-                            <th>Tarih</th>
-                            <th>Islem No</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {subscriptionPurchases.slice(0, 6).map((row) => (
-                            <tr key={row._id}>
-                              <td>{row.planTitle}</td>
-                              <td>{row.amount} {row.currency}</td>
-                              <td>{new Date(row.purchasedAt).toLocaleString('tr-TR')}</td>
-                              <td>{row.transactionRef || '-'}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              ) : null}
             </>
+          ) : null}
+          {profile?.role === 'carrier' && activePanel === 'subscriptions' ? (
+            <div className="panel-card p-4">
+              <div className="d-flex justify-content-between align-items-center mb-3">
+                <h4 className="fw-bold mb-0">Abonelik Satin Alma Gecmisi</h4>
+                <Link to="/abonelik/plan-1776496671427" className="btn btn-sm btn-outline-primary">
+                  Paketi Yukselt
+                </Link>
+              </div>
+              {!subscriptionPurchases.length ? (
+                <div className="text-secondary">Henuz satin alma kaydi yok.</div>
+              ) : (
+                <div className="table-responsive">
+                  <table className="table align-middle mb-0">
+                    <thead>
+                      <tr>
+                        <th>Paket</th>
+                        <th>Tutar</th>
+                        <th>Tarih</th>
+                        <th>Islem No</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {subscriptionPurchases.map((row) => (
+                        <tr key={row._id}>
+                          <td>{row.planTitle}</td>
+                          <td>{row.amount} {row.currency}</td>
+                          <td>{new Date(row.purchasedAt).toLocaleString('tr-TR')}</td>
+                          <td>{row.transactionRef || '-'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
           ) : null}
 
           {activePanel === 'profile' && profile ? (
-            <div className="panel-card p-4 mb-4">
-              <h4 className="fw-bold mb-3">Profil Duzenle</h4>
-              <div className="row g-3">
-                <div className="col-md-4">
-                  <label className="form-label">Ad Soyad</label>
-                  <input
-                    className="form-control"
-                    value={editFullName}
-                    onChange={(e) => setEditFullName(e.target.value)}
-                  />
-                </div>
-                <div className="col-md-4">
-                  <label className="form-label">Kullaniçi Tipi</label>
-                  <select
-                    className="form-select"
-                    value={editPersonType || 'individual'}
-                    onChange={(e) => setEditPersonType(e.target.value as UserProfile['personType'])}
-                  >
-                    <option value="individual">Bireysel</option>
-                    <option value="sole_proprietor">Sahis Firmasi</option>
-                    <option value="corporate">Kurumsal</option>
-                  </select>
-                </div>
-                <div className="col-md-4">
-                  <label className="form-label">Şehir</label>
-                  <select
-                    className="form-select"
-                    value={selectedCityId}
-                    onChange={(e) => {
-                      setSelectedCityId(e.target.value);
-                      setSelectedDistrictName('');
-                    }}
-                  >
-                    <option value="">Şehir seçiniz</option>
-                    {cities.map((city) => (
-                      <option key={city.id} value={city.id}>{city.name}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="col-md-4">
-                  <label className="form-label">İlçe</label>
-                  <select
-                    className="form-select"
-                    value={selectedDistrictName}
-                    onChange={(e) => setSelectedDistrictName(e.target.value)}
-                    disabled={!selectedCityId}
-                  >
-                    <option value="">İlçe seçiniz</option>
-                    {districtOptions.map((district) => (
-                      <option key={district.id} value={district.name}>{district.name}</option>
-                    ))}
-                  </select>
-                </div>
+            <div className="panel-card p-4 mb-4 account-edit-shell">
+              <div className="account-edit-head mb-3">
+                <h4 className="fw-bold mb-1">Profil Duzenle</h4>
+                <p className="mb-0">Bilgilerini daha hizli yonetebilmen icin alanlari mantikli gruplara ayirdik.</p>
+              </div>
 
-                {profile.role === 'carrier' ? (
-                  <div className="col-md-8">
-                    <label className="form-label d-block">Taşıma Modlari</label>
-                    <div className="form-check form-check-inline">
+              <div className="account-edit-section mb-3">
+                <div className="account-edit-section-title">Temel Bilgiler</div>
+                <div className="row g-3">
+                  <div className="col-md-6">
+                    <label className="form-label">Ad Soyad</label>
+                    <input
+                      className="form-control"
+                      value={editFullName}
+                      onChange={(e) => setEditFullName(e.target.value)}
+                      placeholder="Ad Soyad"
+                    />
+                  </div>
+                  <div className="col-md-6">
+                    <label className="form-label">Kullanici Tipi</label>
+                    <select
+                      className="form-select"
+                      value={editPersonType || 'individual'}
+                      onChange={(e) => setEditPersonType(e.target.value as UserProfile['personType'])}
+                    >
+                      <option value="individual">Bireysel</option>
+                      <option value="sole_proprietor">Sahis Firmasi</option>
+                      <option value="corporate">Kurumsal</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="account-edit-section mb-3">
+                <div className="account-edit-section-title">Iletisim Bilgileri</div>
+                <div className="row g-3">
+                  <div className="col-md-6">
+                    <label className="form-label">Telefon</label>
+                    <input className="form-control" value={profile.phone || ''} disabled />
+                  </div>
+                  <div className="col-md-6">
+                    <label className="form-label">E-posta</label>
+                    <input className="form-control" value={profile.email || '-'} disabled />
+                  </div>
+                </div>
+              </div>
+
+              <div className="account-edit-section mb-3">
+                <div className="account-edit-section-title">Konum</div>
+                <div className="row g-3">
+                  <div className="col-md-6">
+                    <label className="form-label">Sehir</label>
+                    <select
+                      className="form-select"
+                      value={selectedCityId}
+                      onChange={(e) => {
+                        setSelectedCityId(e.target.value);
+                        setSelectedDistrictName('');
+                      }}
+                    >
+                      <option value="">Sehir seciniz</option>
+                      {cities.map((city) => (
+                        <option key={city.id} value={city.id}>{city.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="col-md-6">
+                    <label className="form-label">Ilce</label>
+                    <select
+                      className="form-select"
+                      value={selectedDistrictName}
+                      onChange={(e) => setSelectedDistrictName(e.target.value)}
+                      disabled={!selectedCityId}
+                    >
+                      <option value="">Ilce seciniz</option>
+                      {districtOptions.map((district) => (
+                        <option key={district.id} value={district.name}>{district.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {profile.role === 'carrier' ? (
+                <div className="account-edit-section mb-3">
+                  <div className="account-edit-section-title">Tasima Modlari</div>
+                  <div className="account-mode-grid">
+                    <label className={`account-mode-chip ${editWorkingModes.includes('intracity') ? 'is-active' : ''}`} htmlFor="modeIntracity">
                       <input
                         id="modeIntracity"
                         className="form-check-input"
@@ -980,9 +1588,9 @@ export function AccountPage() {
                           else setEditWorkingModes((prev) => prev.filter((m) => m !== 'intracity'));
                         }}
                       />
-                      <label htmlFor="modeIntracity" className="form-check-label">Şehir Ici</label>
-                    </div>
-                    <div className="form-check form-check-inline">
+                      <span>Sehir Ici</span>
+                    </label>
+                    <label className={`account-mode-chip ${editWorkingModes.includes('intercity') ? 'is-active' : ''}`} htmlFor="modeIntercity">
                       <input
                         id="modeIntercity"
                         className="form-check-input"
@@ -993,18 +1601,168 @@ export function AccountPage() {
                           else setEditWorkingModes((prev) => prev.filter((m) => m !== 'intercity'));
                         }}
                       />
-                      <label htmlFor="modeIntercity" className="form-check-label">Şehirler Arasi</label>
+                      <span>Sehirler Arasi</span>
+                    </label>
+                  </div>
+                </div>
+              ) : null}
+
+              {(editPersonType === 'sole_proprietor' || editPersonType === 'corporate') ? (
+                <div className="account-edit-section mb-3">
+                  <div className="account-edit-section-title">Sirket Bilgileri</div>
+                  <div className="row g-3">
+                    <div className="col-md-6">
+                      <label className="form-label">Sirket Adi</label>
+                      <input
+                        className="form-control"
+                        value={editCompanyName}
+                        onChange={(e) => setEditCompanyName(e.target.value)}
+                        placeholder="Ornek: Kargo Lojistik"
+                      />
+                    </div>
+                    <div className="col-md-6">
+                      <label className="form-label">Sirket Unvani</label>
+                      <input
+                        className="form-control"
+                        value={editCompanyTitle}
+                        onChange={(e) => setEditCompanyTitle(e.target.value)}
+                        placeholder="Ornek: Kargo Lojistik Tic. Ltd. Sti."
+                      />
+                    </div>
+                    <div className="col-md-4">
+                      <label className="form-label">Vergi Numarasi</label>
+                      <input
+                        className="form-control"
+                        value={editTaxNumber}
+                        onChange={(e) => setEditTaxNumber(e.target.value)}
+                        placeholder="Vergi numarasi"
+                      />
+                    </div>
+                    <div className="col-md-4">
+                      <label className="form-label">Yetkili Kisi</label>
+                      <input
+                        className="form-control"
+                        value={editAuthorizedPersonName}
+                        onChange={(e) => setEditAuthorizedPersonName(e.target.value)}
+                        placeholder="Ad Soyad"
+                      />
+                    </div>
+                    <div className="col-md-12">
+                      <label className="form-label">Fatura Adresi</label>
+                      <textarea
+                        className="form-control"
+                        rows={3}
+                        value={editBillingAddress}
+                        onChange={(e) => setEditBillingAddress(e.target.value)}
+                        placeholder="Fatura adresi"
+                      />
                     </div>
                   </div>
-                ) : null}
+                </div>
+              ) : null}
 
-                <div className="col-12 d-flex flex-wrap gap-2 align-items-center">
-                  <button type="button" className="btn btn-primary" disabled={saving} onClick={() => void saveProfile()}>
-                    {saving ? 'Kaydediliyor...' : 'Profili Kaydet'}
-                  </button>
-                  {saveMessage ? <span className="text-secondary small">{saveMessage}</span> : null}
+              <div className="col-12 d-flex flex-wrap gap-2 align-items-center">
+                <button type="button" className="btn btn-primary" disabled={saving} onClick={() => void saveProfile()}>
+                  {saving ? 'Kaydediliyor...' : 'Profili Kaydet'}
+                </button>
+                {saveMessage ? <span className="text-secondary small">{saveMessage}</span> : null}
+              </div>
+            </div>
+          ) : null}
+
+          {activePanel === 'reviews' && profile ? (
+            <div className="panel-card p-3 mb-4 received-reviews-shell">
+              <div className="received-reviews-head">
+                <div>
+                  <h5 className="fw-bold mb-1">Aldığım Yorumlar ve Puanlar</h5>
+                  <p className="mb-0">Karşı taraftan aldığınız değerlendirmeleri buradan takip edebilirsiniz.</p>
+                </div>
+                <div className="received-reviews-stats">
+                  <span className="received-reviews-stat">
+                    <small>Toplam</small>
+                    <strong>{receivedReviewSummary.count}</strong>
+                  </span>
+                  <span className="received-reviews-stat is-score">
+                    <small>Ortalama</small>
+                    <strong>{receivedReviewSummary.avg > 0 ? `${receivedReviewSummary.avg.toFixed(2)} / 5` : '- / 5'}</strong>
+                  </span>
                 </div>
               </div>
+
+              <div className="received-reviews-toolbar mb-2">
+                <span className="carrier-offers-toolbar-count">{sortedReceivedReviews.length} kayıt</span>
+                <select
+                  className="form-select form-select-sm received-reviews-sort"
+                  value={receivedReviewSort}
+                  onChange={(e) =>
+                    setReceivedReviewSort(
+                      e.target.value as 'newest' | 'oldest' | 'rating_high' | 'rating_low' | 'commented_first',
+                    )
+                  }
+                >
+                  <option value="newest">Sıralama: En Yeni</option>
+                  <option value="oldest">Sıralama: En Eski</option>
+                  <option value="rating_high">Sıralama: Puan (Yüksekten)</option>
+                  <option value="rating_low">Sıralama: Puan (Düşükten)</option>
+                  <option value="commented_first">Sıralama: Yorumlu Olanlar</option>
+                </select>
+              </div>
+
+              {sortedReceivedReviews.length === 0 ? (
+                <div className="text-secondary">Henüz aldığınız yorum bulunmuyor.</div>
+              ) : (
+                <div className="received-reviews-list">
+                  {sortedReceivedReviews.map((row) => {
+                    const reviewerName =
+                      typeof row.reviewerUserId === 'string' ? 'Kullanıcı' : row.reviewerUserId?.fullName || 'Kullanıcı';
+                    const reviewerRole =
+                      typeof row.reviewerUserId === 'string' ? '' : row.reviewerUserId?.role || '';
+                    const shipmentObj = typeof row.shipmentId === 'string' ? null : row.shipmentId;
+                    const shipmentId = shipmentObj?._id || (typeof row.shipmentId === 'string' ? row.shipmentId : '');
+                    const shipmentTitle = shipmentObj?.title || 'İlan';
+                    const initials = reviewerName
+                      .split(' ')
+                      .filter(Boolean)
+                      .slice(0, 2)
+                      .map((p) => p.charAt(0).toLocaleUpperCase('tr-TR'))
+                      .join('') || 'K';
+                    const rating = Math.max(1, Math.min(5, Number(row.rating || 0) || 0));
+                    return (
+                      <article key={row._id} className="received-review-card">
+                        <div className="received-review-avatar">{initials}</div>
+                        <div className="received-review-main">
+                          <div className="received-review-top">
+                            <div>
+                              <strong>{reviewerName}</strong>
+                              <span className="received-review-role">{roleLabel(reviewerRole)}</span>
+                            </div>
+                            <div className="received-review-stars" aria-label={`${rating} yıldız`}>
+                              {'★'.repeat(rating)}
+                              {'☆'.repeat(Math.max(0, 5 - rating))}
+                            </div>
+                          </div>
+                          <div className="received-review-comment">{row.comment?.trim() || 'Yorum bırakılmadı.'}</div>
+                          <div className="received-review-meta">
+                            <span>
+                              <i className="bi bi-calendar3" />{' '}
+                              {row.createdAt ? new Date(row.createdAt).toLocaleString('tr-TR') : '-'}
+                            </span>
+                            {shipmentId ? (
+                              <Link to={`/hesabim/yuk/${shipmentId}`} className="received-review-shipment-link">
+                                <i className="bi bi-box-seam" /> {shipmentTitle}
+                              </Link>
+                            ) : (
+                              <span>
+                                <i className="bi bi-box-seam" /> {shipmentTitle}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           ) : null}
 
@@ -1018,17 +1776,17 @@ export function AccountPage() {
                 <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'all' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('all')}>
                   Tumu <span className="carrier-tab-count">{latestShipments.length}</span>
                 </button>
-                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'published' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('published')}>
-                  Yayinda <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'published').length}</span>
-                </button>
-                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'offer_collecting' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('offer_collecting')}>
-                  Teklif Topluyor <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'offer_collecting').length}</span>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'open_pool' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('open_pool')}>
+                  Aktif İlanlar <span className="carrier-tab-count">{latestShipments.filter((x) => ['published', 'offer_collecting'].includes(x.status) && !isExpiredUnassignedShipment(x)).length}</span>
                 </button>
                 <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'matched' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('matched')}>
                   Eslesen <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'matched').length}</span>
                 </button>
                 <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'completed' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('completed')}>
                   Tamamlanan <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'completed').length}</span>
+                </button>
+                <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'expired' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('expired')}>
+                  Süresi Biten <span className="carrier-tab-count">{latestShipments.filter((x) => isExpiredUnassignedShipment(x)).length}</span>
                 </button>
                 <button type="button" className={`carrier-tab-btn ${shipperShipmentTab === 'cancelled' ? 'is-active' : ''}`} onClick={() => setShipperShipmentTab('cancelled')}>
                   Iptal <span className="carrier-tab-count">{latestShipments.filter((x) => x.status === 'cancelled').length}</span>
@@ -1037,52 +1795,86 @@ export function AccountPage() {
                   Diger <span className="carrier-tab-count">{latestShipments.filter((x) => !['published', 'offer_collecting', 'matched', 'completed', 'cancelled'].includes(x.status)).length}</span>
                 </button>
               </div>
-              <div className="table-responsive">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Baslik</th>
-                      <th>Guzergah</th>
-                      <th>Mod</th>
-                      <th>Durum</th>
-                      <th>Teklif</th>
-                      <th>Tarih</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredShipperShipments.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} className="text-secondary">Henuz olusturulmus yuk bulunmuyor.</td>
-                      </tr>
-                    ) : (
-                      filteredShipperShipments.map((item) => (
-                        <tr key={item._id}>
-                          <td>{item.title}</td>
-                          <td>{`${item.pickupCity || '-'} / ${item.dropoffCity || '-'}`}</td>
-                          <td>{modeLabel(item.transportMode)}</td>
-                          <td><span className="badge text-bg-light border">{shipmentStatusLabel(item.status)}</span></td>
-                          <td>{item.offerStats?.total ?? 0}</td>
-                          <td>{new Date(item.createdAt).toLocaleDateString('tr-TR')}</td>
-                          <td className="text-end">
-                            <div className="d-flex gap-2 justify-content-end">
-                              <Link className="btn btn-sm btn-outline-primary" to={`/hesabim/yuk/${item._id}`}>
-                                Detay
-                              </Link>
-                              <Link className="btn btn-sm btn-outline-secondary" to={`/hesabim/yuk/${item._id}/duzenle`}>
-                                Duzenle
-                              </Link>
-                            </div>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
+              <div className="carrier-offers-toolbar mb-3">
+                <span className="carrier-offers-toolbar-count">{sortedShipperShipments.length} kayit</span>
+                <select
+                  className="form-select form-select-sm shipper-shipments-sort"
+                  value={shipperShipmentSort}
+                  onChange={(e) => setShipperShipmentSort(e.target.value as 'newest' | 'oldest' | 'offers_high' | 'offers_low' | 'title')}
+                >
+                  <option value="newest">Siralama: En Yeni</option>
+                  <option value="oldest">Siralama: En Eski</option>
+                  <option value="offers_high">Siralama: Teklif (Yuksekten)</option>
+                  <option value="offers_low">Siralama: Teklif (Dusukten)</option>
+                  <option value="title">Siralama: Basliga Gore</option>
+                </select>
               </div>
+              {sortedShipperShipments.length === 0 ? (
+                <div className="text-secondary">Henuz olusturulmus yuk bulunmuyor.</div>
+              ) : (
+                <div className="shipper-shipment-premium-list">
+                  {sortedShipperShipments.map((item) => {
+                    const isExpired = isExpiredUnassignedShipment(item);
+                    const hasOffer = Number(item.offerStats?.total || 0) > 0;
+                    const canCancelOpenWithOffer = ['published', 'offer_collecting'].includes(item.status) && hasOffer;
+                    const canEdit = !['matched', 'completed', 'cancelled'].includes(item.status) && !canCancelOpenWithOffer && !isExpired;
+                    const canRepublish = item.status === 'cancelled' || isExpired;
+                    const canCancel = canCancelOpenWithOffer || isExpired;
+                    return (
+                      <article key={item._id} className="shipper-shipment-premium-card">
+                        <div className="shipper-shipment-premium-main">
+                          <div className="shipper-shipment-premium-top">
+                            <h5 className="mb-0">{item.title || '-'}</h5>
+                            <span className={`shipment-status-pill ${shipmentListStatusTone(item)}`}>
+                              {shipmentListStatusLabel(item)}
+                            </span>
+                          </div>
+                          <div className="shipper-shipment-premium-meta">
+                            <span><i className="bi bi-geo-alt"></i> {`${item.pickupCity || '-'} / ${item.dropoffCity || '-'}`}</span>
+                            <span><i className="bi bi-signpost-2"></i> {modeLabel(item.transportMode)}</span>
+                            <span><i className="bi bi-cash-stack"></i> Teklif: {item.offerStats?.total ?? 0}</span>
+                            <span><i className="bi bi-calendar3"></i> {new Date(item.createdAt).toLocaleDateString('tr-TR')}</span>
+                          </div>
+                          <div className="mt-2">{getReviewBadge(item._id, item.status)}</div>
+                        </div>
+                        <div className="shipper-shipment-premium-actions">
+                          <Link className="btn btn-sm btn-outline-primary" to={`/hesabim/yuk/${item._id}`}>
+                            Detay
+                          </Link>
+                          {item.status === 'completed' ? (
+                            <Link className="btn btn-sm btn-outline-success" to={`/hesabim/yuk/${item._id}`}>
+                              Yorum Yap
+                            </Link>
+                          ) : null}
+                          {canEdit ? (
+                            <Link className="btn btn-sm btn-outline-secondary" to={`/hesabim/yuk/${item._id}/duzenle`}>
+                              Duzenle
+                            </Link>
+                          ) : null}
+                          {canCancel ? (
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-outline-danger"
+                              disabled={shipmentActionLoading === item._id}
+                              onClick={() => void cancelShipment(item._id)}
+                            >
+                              {shipmentActionLoading === item._id ? 'Isleniyor...' : 'Iptal Et'}
+                            </button>
+                          ) : null}
+                          {canRepublish ? (
+                            <Link className="btn btn-sm btn-primary" to={`/app?tekrar=${item._id}`}>
+                              Kopyala ve Yeniden Yayinla
+                            </Link>
+                          ) : null}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           ) : null}
-          {profile?.role === 'shipper' && activePanel !== 'shipments' ? (
+          {profile?.role === 'shipper' && activePanel === 'overview' ? (
             <div className="panel-card p-4">
               <div className="d-flex justify-content-between align-items-center mb-3">
                 <h4 className="fw-bold mb-0">Oluşturdugum Yükler</h4>
@@ -1106,13 +1898,40 @@ export function AccountPage() {
                     ) : (
                       latestShipments.slice(0, 5).map((item) => (
                         <tr key={item._id}>
-                          <td>{item.title}</td>
-                          <td><span className="badge text-bg-light border">{item.status}</span></td>
+                          <td>
+                            <div>{item.title}</div>
+                            <div className="mt-1">{getReviewBadge(item._id, item.status)}</div>
+                          </td>
+                          <td>
+                            <span className={`shipment-status-pill ${shipmentListStatusTone(item)}`}>
+                              {shipmentListStatusLabel(item)}
+                            </span>
+                          </td>
                           <td>{new Date(item.createdAt).toLocaleDateString('tr-TR')}</td>
                           <td className="text-end">
                             <div className="d-flex gap-2 justify-content-end">
                               <Link className="btn btn-sm btn-outline-primary" to={`/hesabim/yuk/${item._id}`}>Detay</Link>
-                              <Link className="btn btn-sm btn-outline-secondary" to={`/hesabim/yuk/${item._id}/duzenle`}>Duzenle</Link>
+                              {item.status === 'completed' ? (
+                                <Link className="btn btn-sm btn-outline-success" to={`/hesabim/yuk/${item._id}`}>Yorum Yap</Link>
+                              ) : null}
+                              {!['matched', 'completed', 'cancelled'].includes(item.status) && !(Number(item.offerStats?.total || 0) > 0 && ['published', 'offer_collecting'].includes(item.status)) && !isExpiredUnassignedShipment(item) ? (
+                                <Link className="btn btn-sm btn-outline-secondary" to={`/hesabim/yuk/${item._id}/duzenle`}>Duzenle</Link>
+                              ) : null}
+                              {(Number(item.offerStats?.total || 0) > 0 && ['published', 'offer_collecting'].includes(item.status)) || isExpiredUnassignedShipment(item) ? (
+                                <button
+                                  type="button"
+                                  className="btn btn-sm btn-outline-danger"
+                                  disabled={shipmentActionLoading === item._id}
+                                  onClick={() => void cancelShipment(item._id)}
+                                >
+                                  {shipmentActionLoading === item._id ? 'Isleniyor...' : 'Iptal Et'}
+                                </button>
+                              ) : null}
+                              {item.status === 'cancelled' || isExpiredUnassignedShipment(item) ? (
+                                <Link className="btn btn-sm btn-primary" to={`/app?tekrar=${item._id}`}>
+                                  Kopyala ve Yeniden Yayinla
+                                </Link>
+                              ) : null}
                             </div>
                           </td>
                         </tr>
@@ -1124,106 +1943,188 @@ export function AccountPage() {
             </div>
           ) : null}
 
-          {profile?.role === 'carrier' && activePanel === 'feed' ? (
-            <div className="panel-card p-4">
-              <div className="d-flex justify-content-between align-items-center mb-3">
-                <h4 className="fw-bold mb-0">Yük Havuzu</h4>
-                <button type="button" className="btn btn-sm btn-outline-primary" onClick={() => void refreshCarrierData()}>
-                  Yenile
-                </button>
-              </div>
-              {activeVehicles.length === 0 ? (
-                <div className="alert alert-warning mb-3">
-                  Teklif verebilmek için en az bir aktif araca ihtiyaciniz var.
+          {profile?.role === 'carrier' && activePanel === 'nearby_map' ? (
+            <NearbyLoadsMapPanel
+              loads={carrierFeed}
+              onOpenDetail={(shipmentId) => navigate(`/hesabim/yuk/${shipmentId}`)}
+            />
+          ) : null}
+          {profile?.role === 'carrier' && activePanel === 'load_alerts' ? (
+            <div className="d-grid gap-3">
+              <div className="panel-card p-4 carrier-alert-form-card">
+                <div className="carrier-alert-form-head d-flex justify-content-between align-items-start mb-3">
+                  <div>
+                    <h4 className="fw-bold mb-1">
+                      <i className="bi bi-bell-fill me-2 text-primary"></i>
+                      {alertEditId ? 'Bildirim Kuralını Düzenle' : 'Yeni Bildirim Kuralı'}
+                    </h4>
+                    <p className="text-secondary mb-0">
+                      Yeni bir yük yayınlandığında sana hangi kriterlerde bildirim gelsin belirle.
+                    </p>
+                  </div>
+                  {alertEditId ? (
+                    <button type="button" className="btn btn-outline-secondary btn-sm" onClick={resetAlertForm}>
+                      Düzenlemeyi İptal Et
+                    </button>
+                  ) : null}
                 </div>
-              ) : null}
-              <div className="alert alert-info mb-3 d-flex flex-wrap justify-content-between align-items-center gap-2">
-                <div>
-                  Yük havuzunda sadece teklif vermediğiniz ilanlar gösteriliyor. Teklif verdikleriniz ayrı listelenir.
-                </div>
-                <button type="button" className="btn btn-sm btn-outline-primary" onClick={() => setActivePanel('offers')}>
-                  Tekliflerime Git
-                </button>
-              </div>
-              {offeredInFeed.length > 0 ? (
-                <div className="mb-3">
-                  <div className="small text-secondary mb-2">Yük havuzunda teklif verdiğim ilanlar:</div>
-                  <div className="d-flex flex-wrap gap-2">
-                    {offeredInFeed.slice(0, 12).map((item) => (
-                      <Link key={item._id} to={`/hesabim/yuk/${item._id}`} className="btn btn-sm btn-outline-secondary">
-                        {item.title} {item.myOfferStatus ? `(${item.myOfferStatus})` : ''}
-                      </Link>
-                    ))}
+
+                <div className="row g-3">
+                  <div className="col-md-4">
+                    <label className="form-label fw-semibold">Kural Adı</label>
+                    <input
+                      className="form-control shipment-input carrier-alert-input"
+                      placeholder="Örn: İstanbul içi soğuk zincir"
+                      value={alertName}
+                      onChange={(e) => setAlertName(e.target.value)}
+                    />
+                    <small className="text-secondary">Kurala kısa ve ayırt edici bir isim ver.</small>
+                  </div>
+                  <div className="col-md-2">
+                    <label className="form-label fw-semibold">Taşıma Modu</label>
+                    <select className="form-select shipment-input carrier-alert-input" value={alertMode} onChange={(e) => setAlertMode(e.target.value as 'all' | 'intracity' | 'intercity')}>
+                      <option value="all">Tümü</option>
+                      <option value="intracity">Şehir İçi</option>
+                      <option value="intercity">Şehirler Arası</option>
+                    </select>
+                  </div>
+                  <div className="col-md-2">
+                    <label className="form-label fw-semibold">İl</label>
+                    <select className="form-select shipment-input carrier-alert-input" value={alertCityId} onChange={(e) => setAlertCityId(e.target.value)}>
+                      <option value="">Tüm İller</option>
+                      {cities.map((city) => <option key={city.id} value={city.id}>{city.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="col-md-2">
+                    <label className="form-label fw-semibold">İlçe</label>
+                    <select
+                      className="form-select shipment-input carrier-alert-input"
+                      value={alertDistrict}
+                      onChange={(e) => setAlertDistrict(e.target.value)}
+                      disabled={!alertCityId}
+                    >
+                      <option value="">Tüm İlçeler</option>
+                      {alertDistrictOptions.map((district) => <option key={district.id} value={district.name}>{district.name}</option>)}
+                    </select>
+                  </div>
+                  <div className="col-md-2">
+                    <label className="form-label fw-semibold">Yük Tipi</label>
+                    <select
+                      className="form-select shipment-input carrier-alert-input"
+                      value={alertLoadTypeSlug}
+                      onChange={(e) => setAlertLoadTypeSlug(e.target.value)}
+                    >
+                      <option value="">Tüm Yük Tipleri</option>
+                      {loadTypeOptions.map((loadType) => (
+                        <option key={loadType.key} value={loadType.key}>
+                          {loadType.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
                 </div>
-              ) : null}
-              <div className="table-responsive">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Yük</th>
-                      <th>Rota</th>
-                      <th>Durum</th>
-                      <th>Araç</th>
-                      <th>Tutar</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {openFeed.length === 0 ? (
-                      <tr><td colSpan={6} className="text-secondary">Teklif verilebilecek uygun yuk bulunamadi.</td></tr>
-                    ) : (
-                      openFeed.map((item) => {
-                        const defaultVehicleId = getDefaultVehicleForShipment(item);
-                        const draft = offerDraft[item._id] || { vehicleId: defaultVehicleId, amount: '', note: '' };
-                        return (
-                          <tr key={item._id}>
+
+                <div className="carrier-alert-preview mt-3">
+                  <span className="carrier-alert-preview-label">Önizleme:</span>
+                  <span className="badge text-bg-light">Mod: {alertMode === 'all' ? 'Tümü' : modeLabel(alertMode)}</span>
+                  <span className="badge text-bg-light">İl: {alertCityName || 'Tüm İller'}</span>
+                  <span className="badge text-bg-light">İlçe: {alertDistrict || 'Tüm İlçeler'}</span>
+                  <span className="badge text-bg-light">
+                    Yük: {alertLoadTypeSlug ? (loadTypeLabelMap[alertLoadTypeSlug] || alertLoadTypeSlug) : 'Tüm Yük Tipleri'}
+                  </span>
+                </div>
+
+                <div className="carrier-alert-form-actions mt-3 d-flex gap-2">
+                  <button
+                    type="button"
+                    className="btn btn-primary px-4"
+                    disabled={alertActionLoading === 'save'}
+                    onClick={() => void saveCarrierAlert()}
+                  >
+                    {alertActionLoading === 'save' ? 'Kaydediliyor...' : alertEditId ? 'Güncelle' : 'Kuralı Kaydet'}
+                  </button>
+                  {!alertEditId ? (
+                    <button type="button" className="btn btn-light border px-3" onClick={resetAlertForm}>
+                      Temizle
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="panel-card p-4 carrier-alert-list-card">
+                <div className="d-flex justify-content-between align-items-center mb-3">
+                  <h4 className="fw-bold mb-0">Kayıtlı Bildirim Kuralları</h4>
+                  <span className="badge text-bg-light fs-6">{carrierAlerts.length} adet</span>
+                </div>
+                {carrierAlerts.length === 0 ? (
+                  <div className="carrier-alert-empty text-secondary">
+                    <i className="bi bi-bell-slash me-2"></i>
+                    Henüz bildirim kuralı eklenmedi.
+                  </div>
+                ) : (
+                  <div className="table-responsive">
+                    <table className="table align-middle carrier-alert-table">
+                      <thead>
+                        <tr>
+                          <th>Kural</th>
+                          <th>Filtre</th>
+                          <th>Durum</th>
+                          <th className="text-end">İşlem</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {carrierAlerts.map((alert) => (
+                          <tr key={alert._id}>
                             <td>
-                              <Link className="text-decoration-none fw-semibold" to={`/hesabim/yuk/${item._id}`}>
-                                {item.title}
-                              </Link>
+                              <div className="fw-semibold">{alert.name}</div>
+                              <small className="text-secondary">{alert.createdAt ? new Date(alert.createdAt).toLocaleString('tr-TR') : '-'}</small>
                             </td>
-                            <td>{`${item.pickupCity || '-'} / ${item.dropoffCity || '-'}`}</td>
-                            <td><span className="badge text-bg-light border">{item.status}</span></td>
                             <td>
-                              <select
-                                className="form-select form-select-sm"
-                                value={draft.vehicleId}
-                                onChange={(e) => setOfferDraft((prev) => ({ ...prev, [item._id]: { ...draft, vehicleId: e.target.value } }))}
-                                disabled={activeVehicles.length === 0}
-                              >
-                                <option value="">Araç seçin</option>
-                                {activeVehicles.map((v) => (
-                                  <option key={v._id} value={v._id}>{`${v.vehicleTypeId?.name || 'Araç'} - ${v.plateMasked || ''}`}</option>
-                                ))}
-                              </select>
+                              <span className="badge text-bg-light me-1">
+                                {alert.transportMode === 'all' ? 'Tümü' : modeLabel(alert.transportMode)}
+                              </span>
+                              {alert.city ? <span className="badge text-bg-light me-1">{alert.city}</span> : null}
+                              {alert.district ? <span className="badge text-bg-light me-1">{alert.district}</span> : null}
+                              {alert.loadTypeSlug ? (
+                                <span className="badge text-bg-light">
+                                  {loadTypeLabelMap[alert.loadTypeSlug] || alert.loadTypeSlug}
+                                </span>
+                              ) : null}
                             </td>
                             <td>
-                              <input
-                                className="form-control form-control-sm"
-                                type="number"
-                                min={1}
-                                value={draft.amount}
-                                onChange={(e) => setOfferDraft((prev) => ({ ...prev, [item._id]: { ...draft, amount: e.target.value } }))}
-                                placeholder="â‚º"
-                              />
+                              <span className={`badge ${alert.isActive ? 'text-bg-success' : 'text-bg-secondary'}`}>
+                                {alert.isActive ? 'Aktif' : 'Pasif'}
+                              </span>
                             </td>
                             <td className="text-end">
-                              <button
-                                type="button"
-                                className="btn btn-sm btn-primary"
-                                disabled={offerActionLoading === item._id || activeVehicles.length === 0}
-                                onClick={() => void submitOffer(item._id, defaultVehicleId)}
-                              >
-                                {offerActionLoading === item._id ? 'Gönderiliyor...' : 'Teklif Ver'}
-                              </button>
+                              <div className="d-inline-flex gap-2">
+                                <button type="button" className="btn btn-sm btn-outline-primary px-3" onClick={() => startEditAlert(alert)}>
+                                  Düzenle
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-sm btn-outline-warning px-3"
+                                  disabled={alertActionLoading === alert._id}
+                                  onClick={() => void toggleCarrierAlert(alert)}
+                                >
+                                  {alert.isActive ? 'Pasif Yap' : 'Aktif Yap'}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-sm btn-outline-danger px-3"
+                                  disabled={alertActionLoading === alert._id}
+                                  onClick={() => void deleteCarrierAlert(alert._id)}
+                                >
+                                  Sil
+                                </button>
+                              </div>
                             </td>
                           </tr>
-                        );
-                      })
-                    )}
-                  </tbody>
-                </table>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
           ) : null}
@@ -1418,45 +2319,40 @@ export function AccountPage() {
                   Yenile
                 </button>
               </div>
-              <div className="table-responsive">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Araç Tipi</th>
-                      <th>Plaka</th>
-                      <th>Marka / Model</th>
-                      <th>Durum</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {myVehicles.length === 0 ? (
-                      <tr><td colSpan={5} className="text-secondary">Henuz arac kaydi yok.</td></tr>
-                    ) : (
-                      myVehicles.map((v) => (
-                        <tr key={v._id}>
-                          <td>{v.vehicleTypeId?.name || '-'}</td>
-                          <td>{v.plateMasked || '-'}</td>
-                          <td>{`${v.brand || '-'} ${v.model || ''}`.trim()}</td>
-                          <td><span className="badge text-bg-light border">{v.status}</span></td>
-                          <td className="text-end">
-                            <div className="d-flex gap-2 justify-content-end">
-                              <Link className="btn btn-sm btn-outline-primary" to={`/hesabim/arac/${v._id}`}>Detay</Link>
-                              <Link className="btn btn-sm btn-outline-secondary" to={`/hesabim/arac/${v._id}/duzenle`}>Duzenle</Link>
-                              <Link
-                                className="btn btn-sm btn-primary"
-                                to={`/hesabim?panel=vehicle_docs&vehicleId=${encodeURIComponent(v._id)}`}
-                              >
-                                Belge Ekle
-                              </Link>
-                            </div>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
+              {myVehicles.length === 0 ? (
+                <div className="text-secondary">Henuz arac kaydi yok.</div>
+              ) : (
+                <div className="vehicle-premium-list">
+                  {myVehicles.map((v) => (
+                    <article key={v._id} className="vehicle-premium-card">
+                      <div className="vehicle-premium-main">
+                        <div className="vehicle-premium-top">
+                          <div>
+                            <strong className="vehicle-premium-title">{v.vehicleTypeId?.name || 'Araç'}</strong>
+                            <div className="vehicle-premium-plate">{v.plateMasked || '-'}</div>
+                          </div>
+                          <span className={`shipment-status-pill ${vehicleStatusPillTone(v.status)}`}>
+                            {vehicleStatusLabel(v.status)}
+                          </span>
+                        </div>
+                        <div className="vehicle-premium-meta">
+                          <span><i className="bi bi-truck" /> Marka / Model: {`${v.brand || '-'} ${v.model || ''}`.trim()}</span>
+                        </div>
+                      </div>
+                      <div className="vehicle-premium-actions">
+                        <Link className="btn btn-sm btn-outline-primary" to={`/hesabim/arac/${v._id}`}>Detay</Link>
+                        <Link className="btn btn-sm btn-outline-secondary" to={`/hesabim/arac/${v._id}/duzenle`}>Duzenle</Link>
+                        <Link
+                          className="btn btn-sm btn-primary"
+                          to={`/hesabim?panel=vehicle_docs&vehicleId=${encodeURIComponent(v._id)}`}
+                        >
+                          Belge Ekle
+                        </Link>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
             </div>
           ) : null}
 
@@ -1500,7 +2396,7 @@ export function AccountPage() {
                 </div>
                 <div className="col-md-4">
                   <label className="form-label">Dosya *</label>
-                  <div className="d-flex gap-2 align-items-center">
+                  <div className="d-flex gap-2 align-items-center vehicle-doc-upload-row">
                     <input
                       className="form-control"
                       type="file"
@@ -1525,51 +2421,47 @@ export function AccountPage() {
                   {documentMessage ? <span className="text-secondary small">{documentMessage}</span> : null}
                 </div>
               </div>
-
-              <div className="table-responsive">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Araç</th>
-                      <th>Belge Tipi</th>
-                      <th>Durum</th>
-                      <th>Tarih</th>
-                      <th>Dosya</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredVehicleDocs.length === 0 ? (
-                      <tr><td colSpan={5} className="text-secondary">Secilen araca ait belge kaydi yok.</td></tr>
-                    ) : (
-                      filteredVehicleDocs.map((doc) => (
-                        <tr key={doc._id}>
-                          <td>{myVehicles.find((v) => v._id === String(doc.vehicleId))?.plateMasked || '-'}</td>
-                          <td>{doc.documentType}</td>
-                          <td><span className="badge text-bg-light border">{doc.status}</span></td>
-                          <td>{doc.createdAt ? new Date(doc.createdAt).toLocaleDateString('tr-TR') : '-'}</td>
-                          <td>
-                            {doc.fileUrl ? (
-                              <div className="d-flex gap-2">
-                                <button
-                                  type="button"
-                                  className="btn btn-sm btn-outline-primary"
-                                  onClick={() => {
-                                    setPreviewUrl(toAbsoluteAssetUrl(doc.fileUrl));
-                                    setPreviewTitle(`${doc.documentType} - ${myVehicles.find((v) => v._id === String(doc.vehicleId))?.plateMasked || 'Belge'}`);
-                                  }}
-                                >
-                                  Onizle
-                                </button>
-                                <a href={toAbsoluteAssetUrl(doc.fileUrl)} target="_blank" rel="noreferrer" className="btn btn-sm btn-outline-secondary">Ac</a>
-                              </div>
-                            ) : '-'}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
+              {filteredVehicleDocs.length === 0 ? (
+                <div className="text-secondary">Secilen araca ait belge kaydi yok.</div>
+              ) : (
+                <div className="vehicle-doc-premium-list">
+                  {filteredVehicleDocs.map((doc) => (
+                    <article key={doc._id} className="vehicle-doc-premium-card">
+                      <div className="vehicle-doc-premium-main">
+                        <div className="vehicle-doc-premium-top">
+                          <strong>{vehicleDocumentTypeLabel(doc.documentType)}</strong>
+                          <span className={`shipment-status-pill ${vehicleDocumentStatusPillTone(doc.status)}`}>
+                            {vehicleDocumentStatusLabel(doc.status)}
+                          </span>
+                        </div>
+                        <div className="vehicle-doc-premium-meta">
+                          <span><i className="bi bi-truck" /> {myVehicles.find((v) => v._id === String(doc.vehicleId))?.plateMasked || '-'}</span>
+                          <span><i className="bi bi-calendar3" /> {doc.createdAt ? new Date(doc.createdAt).toLocaleDateString('tr-TR') : '-'}</span>
+                        </div>
+                      </div>
+                      <div className="vehicle-doc-premium-actions">
+                        {doc.fileUrl ? (
+                          <>
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-outline-primary"
+                              onClick={() => {
+                                setPreviewUrl(toAbsoluteAssetUrl(doc.fileUrl));
+                                setPreviewTitle(`${vehicleDocumentTypeLabel(doc.documentType)} - ${myVehicles.find((v) => v._id === String(doc.vehicleId))?.plateMasked || 'Belge'}`);
+                              }}
+                            >
+                              Onizle
+                            </button>
+                            <a href={toAbsoluteAssetUrl(doc.fileUrl)} target="_blank" rel="noreferrer" className="btn btn-sm btn-outline-secondary">Ac</a>
+                          </>
+                        ) : (
+                          <span className="text-secondary small">Dosya yok</span>
+                        )}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
             </div>
           ) : null}
 
@@ -1599,56 +2491,139 @@ export function AccountPage() {
                   Diger ({carrierOffers.filter((x) => ['cancelled', 'expired'].includes(x.status)).length})
                 </button>
               </div>
-              <div className="table-responsive">
-                <table className="table align-middle">
-                  <thead>
-                    <tr>
-                      <th>Yük</th>
-                      <th>Rota</th>
-                      <th>Tutar</th>
-                      <th>Durum</th>
-                      <th>Tarih</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredCarrierOffers.length === 0 ? (
-                      <tr><td colSpan={6} className="text-secondary">Henuz teklif kaydiniz yok.</td></tr>
-                    ) : (
-                      filteredCarrierOffers.map((offer) => (
-                        <tr key={offer._id}>
-                          <td>{offer.shipmentId?.title || '-'}</td>
-                          <td>{`${offer.shipmentId?.pickupCity || '-'} / ${offer.shipmentId?.dropoffCity || '-'}`}</td>
-                          <td>{typeof offer.price === 'number' ? `â‚º${offer.price}` : '-'}</td>
-                          <td><span className="badge text-bg-light border">{offer.status}</span></td>
-                          <td>{offer.createdAt ? new Date(offer.createdAt).toLocaleDateString('tr-TR') : '-'}</td>
-                          <td className="text-end">
-                            <div className="d-flex gap-2 justify-content-end">
-                              {offer.shipmentId?._id ? (
-                                <Link to={`/hesabim/yuk/${offer.shipmentId._id}`} className="btn btn-sm btn-outline-primary">
-                                  Ilan Detayi
-                                </Link>
-                              ) : null}
-                              {['submitted', 'updated'].includes(offer.status) ? (
-                                <button
-                                  type="button"
-                                  className="btn btn-sm btn-outline-danger"
-                                  disabled={offerActionLoading === offer._id}
-                                  onClick={() => void withdrawOffer(offer._id)}
-                                >
-                                  {offerActionLoading === offer._id ? 'Isleniyor...' : 'Geri Cek'}
-                                </button>
-                              ) : (
-                                <span className="text-secondary small">-</span>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
+              <div className="carrier-offers-toolbar mb-3">
+                <span className="carrier-offers-toolbar-count">{sortedCarrierOffers.length} kayit</span>
+                <select
+                  className="form-select form-select-sm carrier-offers-sort"
+                  value={carrierOfferSort}
+                  onChange={(e) => setCarrierOfferSort(e.target.value as 'newest' | 'oldest' | 'price_high' | 'price_low' | 'status')}
+                >
+                  <option value="newest">Siralama: En Yeni</option>
+                  <option value="oldest">Siralama: En Eski</option>
+                  <option value="price_high">Siralama: Fiyat (Yuksekten)</option>
+                  <option value="price_low">Siralama: Fiyat (Dusukten)</option>
+                  <option value="status">Siralama: Duruma Gore</option>
+                </select>
               </div>
+              {sortedCarrierOffers.length === 0 ? (
+                <div className="text-secondary">Henuz teklif kaydiniz yok.</div>
+              ) : (
+                <div className="carrier-offers-premium-list">
+                  {sortedCarrierOffers.map((offer) => (
+                    <article key={offer._id} className="carrier-offers-premium-card">
+                      <div className="carrier-offers-premium-main">
+                        <div className="carrier-offers-premium-top">
+                          <div>
+                            <strong className="carrier-offers-premium-title">{offer.shipmentId?.title || '-'}</strong>
+                            <div className="carrier-offers-premium-route">
+                              {`${offer.shipmentId?.pickupCity || '-'} / ${offer.shipmentId?.dropoffCity || '-'}`}
+                            </div>
+                          </div>
+                          <span className={`shipment-status-pill ${offerStatusPillTone(offer.status)}`}>
+                            {offerStatusLabel(offer.status)}
+                          </span>
+                        </div>
+
+                        <div className="carrier-offers-premium-meta">
+                          <span>
+                            <i className="bi bi-truck" /> {offer.vehicleId?.plateMasked || '-'} {offer.vehicleId?.brand || ''}
+                          </span>
+                          <span>
+                            <i className="bi bi-calendar3" /> {offer.createdAt ? new Date(offer.createdAt).toLocaleDateString('tr-TR') : '-'}
+                          </span>
+                        </div>
+
+                        <div className="mt-2">{getReviewBadge(offer.shipmentId?._id, offer.shipmentId?.status)}</div>
+                      </div>
+
+                      <div className="carrier-offers-premium-right">
+                        <strong className="carrier-offers-price">{formatTryPrice(offer.price)}</strong>
+                        <div className="d-flex gap-2 justify-content-end">
+                          {offer.shipmentId?._id ? (
+                            <Link to={`/hesabim/yuk/${offer.shipmentId._id}`} className="btn btn-sm btn-outline-primary">
+                              Ilan Detayi
+                            </Link>
+                          ) : null}
+                          {['submitted', 'updated'].includes(offer.status) ? (
+                            <button
+                              type="button"
+                              className="btn btn-sm btn-outline-danger"
+                              disabled={offerActionLoading === offer._id}
+                              onClick={() => void withdrawOffer(offer._id)}
+                            >
+                              {offerActionLoading === offer._id ? 'Isleniyor...' : 'Geri Cek'}
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+          {profile?.role === 'carrier' && activePanel === 'completed_loads' ? (
+            <div className="panel-card p-4">
+              <div className="d-flex justify-content-between align-items-center mb-3">
+                <h4 className="fw-bold mb-0">Tamamlanan Yükler</h4>
+                <button type="button" className="btn btn-sm btn-outline-primary" onClick={() => void refreshCarrierData()}>
+                  Yenile
+                </button>
+              </div>
+              <div className="carrier-offers-toolbar mb-3">
+                <span className="carrier-offers-toolbar-count">{sortedCarrierCompletedOffers.length} kayit</span>
+                <select
+                  className="form-select form-select-sm carrier-offers-sort"
+                  value={carrierCompletedSort}
+                  onChange={(e) => setCarrierCompletedSort(e.target.value as 'newest' | 'oldest' | 'price_high' | 'price_low' | 'title')}
+                >
+                  <option value="newest">Siralama: En Yeni</option>
+                  <option value="oldest">Siralama: En Eski</option>
+                  <option value="price_high">Siralama: Fiyat (Yuksekten)</option>
+                  <option value="price_low">Siralama: Fiyat (Dusukten)</option>
+                  <option value="title">Siralama: Basliga Gore</option>
+                </select>
+              </div>
+              {sortedCarrierCompletedOffers.length === 0 ? (
+                <div className="text-secondary">Henuz tamamlanan yük kaydiniz yok.</div>
+              ) : (
+                <div className="carrier-offers-premium-list">
+                  {sortedCarrierCompletedOffers.map((offer) => (
+                    <article key={offer._id} className="carrier-offers-premium-card">
+                      <div className="carrier-offers-premium-main">
+                        <div className="carrier-offers-premium-top">
+                          <div>
+                            <strong className="carrier-offers-premium-title">{offer.shipmentId?.title || '-'}</strong>
+                            <div className="carrier-offers-premium-route">
+                              {`${offer.shipmentId?.pickupCity || '-'} / ${offer.shipmentId?.dropoffCity || '-'}`}
+                            </div>
+                          </div>
+                          <span className={`shipment-status-pill ${shipmentStatusPillTone('completed')}`}>
+                            Tamamlandi
+                          </span>
+                        </div>
+                        <div className="carrier-offers-premium-meta">
+                          <span>
+                            <i className="bi bi-truck" /> {offer.vehicleId?.plateMasked || '-'} {offer.vehicleId?.brand || ''}
+                          </span>
+                          <span>
+                            <i className="bi bi-calendar3" /> {offer.createdAt ? new Date(offer.createdAt).toLocaleDateString('tr-TR') : '-'}
+                          </span>
+                        </div>
+                        <div className="mt-2">{getReviewBadge(offer.shipmentId?._id, offer.shipmentId?.status)}</div>
+                      </div>
+                      <div className="carrier-offers-premium-right">
+                        <strong className="carrier-offers-price">{formatTryPrice(offer.price)}</strong>
+                        {offer.shipmentId?._id ? (
+                          <Link to={`/hesabim/yuk/${offer.shipmentId._id}`} className="btn btn-sm btn-outline-primary">
+                            Ilan Detayi
+                          </Link>
+                        ) : null}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
             </div>
           ) : null}
           <MediaLightbox open={Boolean(previewUrl)} url={previewUrl} title={previewTitle} onClose={() => setPreviewUrl('')} />

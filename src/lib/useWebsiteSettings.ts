@@ -2,9 +2,23 @@
 import { api, toAbsoluteAssetUrl } from '../lib/api';
 import { defaultWebsiteSettings, type WebsiteSettings } from '../types/website';
 
+const SETTINGS_CACHE_KEY = 'an_public_website_settings_v1';
+
+const readCachedSettings = (): WebsiteSettings | null => {
+  try {
+    const raw = localStorage.getItem(SETTINGS_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return { ...defaultWebsiteSettings, ...parsed };
+  } catch {
+    return null;
+  }
+};
+
 export function useWebsiteSettings() {
-  const [settings, setSettings] = useState<WebsiteSettings>(defaultWebsiteSettings);
-  const [loading, setLoading] = useState(true);
+  const [settings, setSettings] = useState<WebsiteSettings>(() => readCachedSettings() || defaultWebsiteSettings);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -12,7 +26,7 @@ export function useWebsiteSettings() {
       try {
         const { data } = await api.get<WebsiteSettings>('/website/public-settings');
         if (mounted) {
-          setSettings({
+          const normalized = {
             ...defaultWebsiteSettings,
             ...data,
             logoUrl: toAbsoluteAssetUrl(data.logoUrl),
@@ -42,11 +56,19 @@ export function useWebsiteSettings() {
             shipmentSubCategoryGroups: Array.isArray(data.shipmentSubCategoryGroups)
               ? data.shipmentSubCategoryGroups
               : defaultWebsiteSettings.shipmentSubCategoryGroups,
-          });
+          };
+
+          setSettings(normalized);
+          try {
+            localStorage.setItem(SETTINGS_CACHE_KEY, JSON.stringify(normalized));
+          } catch {
+            // no-op
+          }
         }
       } catch {
         if (mounted) {
-          setSettings(defaultWebsiteSettings);
+          const cached = readCachedSettings();
+          setSettings(cached || defaultWebsiteSettings);
         }
       } finally {
         if (mounted) {
@@ -91,4 +113,3 @@ export function useWebsiteSettings() {
 
   return { settings, loading };
 }
-

@@ -12,6 +12,7 @@ import { ConversationsPage } from './pages/ConversationsPage';
 import { HomePage } from './pages/HomePage';
 import { LoginPage } from './pages/LoginPage';
 import { NotFoundPage } from './pages/NotFoundPage';
+import { NotificationsPage } from './pages/NotificationsPage';
 import { RegisterPage } from './pages/RegisterPage';
 import { ShipmentDetailPage } from './pages/ShipmentDetailPage';
 import { ShipmentEditPage } from './pages/ShipmentEditPage';
@@ -20,15 +21,7 @@ import { VehicleDetailPage } from './pages/VehicleDetailPage';
 import { VehicleEditPage } from './pages/VehicleEditPage';
 
 function App() {
-  const { settings, loading } = useWebsiteSettings();
-
-  if (loading) {
-    return (
-      <div className="d-flex min-vh-100 align-items-center justify-content-center">
-        <div className="spinner-border text-primary" role="status" />
-      </div>
-    );
-  }
+  const { settings } = useWebsiteSettings();
 
   const alertClass = {
     info: 'alert-info',
@@ -57,6 +50,7 @@ function App() {
           <Route path="/home" element={<Navigate to="/" replace />} />
           <Route path="/app" element={<AppPage />} />
           <Route path="/hesabim" element={<AccountPage />} />
+          <Route path="/bildirimler" element={<NotificationsPage />} />
           <Route path="/mesajlar" element={<ConversationsPage />} />
           <Route path="/mesajlar/:conversationId" element={<ConversationPage />} />
           <Route path="/hesabim/yuk/:shipmentId" element={<ShipmentDetailPage />} />

@@ -8,6 +8,10 @@ type ShipmentDetail = {
   title: string;
   description?: string;
   status: string;
+  offerStats?: {
+    total?: number;
+  };
+  offers?: Array<{ _id?: string }>;
   transportMode: 'intracity' | 'intercity';
   pickupCity?: string;
   pickupDistrict?: string;
@@ -43,6 +47,7 @@ export function ShipmentEditPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
+  const [editLockedReason, setEditLockedReason] = useState('');
 
   const [cities, setCities] = useState<CityOption[]>([]);
   const [districtByCity, setDistrictByCity] = useState<Record<string, DistrictOption[]>>({});
@@ -113,6 +118,17 @@ export function ShipmentEditPage() {
 
         const cityList = Array.isArray(citiesRes.data) ? citiesRes.data : [];
         const shipment = shipmentRes.data;
+        const hasOffer =
+          Number(shipment?.offerStats?.total || 0) > 0 ||
+          (Array.isArray(shipment?.offers) ? shipment.offers.length > 0 : false);
+        const isOpenPool = ['published', 'offer_collecting'].includes(String(shipment?.status || ''));
+
+        if (isOpenPool && hasOffer) {
+          setEditLockedReason('Bu ilan teklif aldı. Artık düzenlenemez, sadece iptal edilip yeniden yayınlanabilir.');
+          setStatus(shipment.status || 'published');
+          setLoading(false);
+          return;
+        }
 
         setCities(cityList);
         setTitle(shipment.title || '');
@@ -174,6 +190,7 @@ export function ShipmentEditPage() {
 
   const submit = async () => {
     if (!shipmentId) return;
+    if (editLockedReason) return;
 
     const originCity = cities.find((x) => x.id === originCityId)?.name;
     const destinationCity = cities.find((x) => x.id === destinationCityId)?.name;
@@ -262,7 +279,21 @@ export function ShipmentEditPage() {
       </div>
 
       {message ? <div className="alert alert-warning">{message}</div> : null}
+      {editLockedReason ? (
+        <div className="panel-card p-4">
+          <div className="alert alert-warning mb-3">{editLockedReason}</div>
+          <div className="d-flex flex-wrap gap-2">
+            <Link to={shipmentId ? `/hesabim/yuk/${shipmentId}` : '/hesabim'} className="btn btn-outline-primary">
+              Ilan Detayina Git
+            </Link>
+            <Link to="/hesabim?panel=shipments" className="btn btn-outline-secondary">
+              Olusturdugum Yuklere Don
+            </Link>
+          </div>
+        </div>
+      ) : null}
 
+      {!editLockedReason ? (
       <div className="panel-card p-4">
         <div className="shipment-edit-summary mb-4">
           <div className="shipment-edit-summary-item">
@@ -373,6 +404,7 @@ export function ShipmentEditPage() {
           </div>
         </div>
       </div>
+      ) : null}
     </section>
   );
 }

@@ -13,6 +13,8 @@ type FooterContentLink = {
   category: 'blog' | 'contract' | 'corporate' | 'info' | 'help';
 };
 
+const FOOTER_LINKS_CACHE_PREFIX = 'an_footer_links_v1';
+
 export function Footer({ settings }: Props) {
   const [footerLinks, setFooterLinks] = useState<FooterContentLink[]>([]);
   const isAuthenticated = useMemo(() => Boolean(localStorage.getItem('an_user_token')), []);
@@ -32,16 +34,33 @@ export function Footer({ settings }: Props) {
 
   useEffect(() => {
     let mounted = true;
+    const cacheKey = `${FOOTER_LINKS_CACHE_PREFIX}:${audience}`;
     const loadFooterContents = async () => {
+      try {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached && mounted) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed)) setFooterLinks(parsed);
+        }
+      } catch {
+        // no-op
+      }
+
       try {
         const { data } = await api.get<FooterContentLink[]>('/content/public', {
           params: { placement: 'footer', audience, limit: 50 },
         });
         if (!mounted) return;
-        setFooterLinks(Array.isArray(data) ? data : []);
+        const next = Array.isArray(data) ? data : [];
+        setFooterLinks(next);
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(next));
+        } catch {
+          // no-op
+        }
       } catch {
         if (!mounted) return;
-        setFooterLinks([]);
+        if (!footerLinks.length) setFooterLinks([]);
       }
     };
 

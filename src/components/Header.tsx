@@ -20,6 +20,18 @@ type ConversationInboxRow = {
   lastMessage?: { text?: string } | null;
 };
 
+type NotificationInboxResponse = {
+  unreadCount?: number;
+  rows?: Array<{
+    _id: string;
+    title?: string;
+    body?: string;
+    createdAt?: string;
+  }>;
+};
+
+const HEADER_LINKS_CACHE_PREFIX = 'an_header_links_v1';
+
 export function Header({ settings }: Props) {
   const location = useLocation();
   const [headerLinks, setHeaderLinks] = useState<CmsLink[]>([]);
@@ -27,6 +39,7 @@ export function Header({ settings }: Props) {
   const [navOpen, setNavOpen] = useState(false);
   const [messageUnreadTotal, setMessageUnreadTotal] = useState(0);
   const [lastMessagePreview, setLastMessagePreview] = useState('');
+  const [notificationUnreadTotal, setNotificationUnreadTotal] = useState(0);
 
   const audience = useMemo(() => {
     try {
@@ -58,18 +71,35 @@ export function Header({ settings }: Props) {
 
   useEffect(() => {
     let mounted = true;
+    const cacheKey = `${HEADER_LINKS_CACHE_PREFIX}:${audience}`;
 
     const loadCmsLinks = async () => {
+      try {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached && mounted) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed)) setHeaderLinks(parsed);
+        }
+      } catch {
+        // no-op
+      }
+
       try {
         const headerRes = await api.get<CmsLink[]>('/content/public', {
           params: { placement: 'header', audience, limit: 20 },
         });
 
         if (!mounted) return;
-        setHeaderLinks(Array.isArray(headerRes.data) ? headerRes.data : []);
+        const next = Array.isArray(headerRes.data) ? headerRes.data : [];
+        setHeaderLinks(next);
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(next));
+        } catch {
+          // no-op
+        }
       } catch {
         if (!mounted) return;
-        setHeaderLinks([]);
+        if (!headerLinks.length) setHeaderLinks([]);
       }
     };
 
@@ -92,6 +122,7 @@ export function Header({ settings }: Props) {
     const token = localStorage.getItem('an_user_token');
     if (!token) {
       setMessageUnreadTotal(0);
+      setNotificationUnreadTotal(0);
       setLastMessagePreview('');
       return;
     }
@@ -116,7 +147,21 @@ export function Header({ settings }: Props) {
       }
     };
 
+    const loadNotifications = async () => {
+      try {
+        const { data } = await api.get<NotificationInboxResponse>('/notifications/my', {
+          params: { limit: 20 },
+        });
+        if (!mounted) return;
+        setNotificationUnreadTotal(Number(data?.unreadCount || 0));
+      } catch {
+        if (!mounted) return;
+        setNotificationUnreadTotal(0);
+      }
+    };
+
     void loadInbox();
+    void loadNotifications();
 
     const socket = io(apiOrigin, {
       transports: ['websocket'],
@@ -125,15 +170,30 @@ export function Header({ settings }: Props) {
     socket.on('conversations:refresh', () => {
       void loadInbox();
     });
+    socket.on('notifications:refresh', () => {
+      void loadNotifications();
+    });
     socket.on('connect', () => {
       void loadInbox();
+      void loadNotifications();
     });
+
+    const onLocalNotificationsUpdated = () => {
+      void loadNotifications();
+    };
+    window.addEventListener('notifications:local-updated', onLocalNotificationsUpdated as EventListener);
+
+    const intervalId = window.setInterval(() => {
+      void loadNotifications();
+    }, 30000);
 
     return () => {
       mounted = false;
+      window.clearInterval(intervalId);
+      window.removeEventListener('notifications:local-updated', onLocalNotificationsUpdated as EventListener);
       socket.disconnect();
     };
-  }, [isAuthenticated, location.pathname]);
+  }, [isAuthenticated]);
 
   return (
     <header className="site-header fixed-top">
@@ -147,6 +207,7 @@ export function Header({ settings }: Props) {
           <div className="d-flex gap-2 align-items-center flex-wrap">
             <span className="chip chip-soft">120 Saat Kuralı</span>
             <span className="chip chip-soft">7/24 Operasyon</span>
+            <NavLink to="/blog" className="chip text-decoration-none">Blog</NavLink>
             {headerLinks.length > 0 ? (
               headerLinks.slice(0, 3).map((item) => (
                 <NavLink key={item.slug} to={`/content/${item.slug}`} className="chip text-decoration-none">
@@ -155,7 +216,6 @@ export function Header({ settings }: Props) {
               ))
             ) : (
               <>
-                <NavLink to="/blog" className="chip text-decoration-none">Blog</NavLink>
                 <NavLink to="/contact" className="chip text-decoration-none">Demo Talebi</NavLink>
               </>
             )}
@@ -199,12 +259,24 @@ export function Header({ settings }: Props) {
                 </li>
               ))}
               <li className="nav-item"><NavLink to="/app" className="nav-link" onClick={() => setNavOpen(false)}>Yük İşlemleri</NavLink></li>
-              <li className="nav-item"><NavLink to="/blog" className="nav-link" onClick={() => setNavOpen(false)}>Blog</NavLink></li>
+              {isAuthenticated ? (
+                <li className="nav-item">
+                  <NavLink
+                    to="/bildirimler"
+                    className="btn btn-outline-success nav-cta-btn nav-notifications-btn ms-lg-2 d-inline-flex align-items-center gap-2"
+                    onClick={() => setNavOpen(false)}
+                  >
+                    <i className="bi bi-bell-fill" />
+                    <span>Bildirimler</span>
+                    {notificationUnreadTotal > 0 ? <span className="badge text-bg-danger">{notificationUnreadTotal}</span> : null}
+                  </NavLink>
+                </li>
+              ) : null}
               {isAuthenticated ? (
                 <li className="nav-item">
                   <NavLink
                     to="/mesajlar"
-                    className="btn btn-success nav-cta-btn nav-messages-btn ms-lg-2 d-inline-flex align-items-center gap-2"
+                    className="btn btn-outline-success nav-cta-btn nav-messages-btn ms-lg-2 d-inline-flex align-items-center gap-2"
                     onClick={() => setNavOpen(false)}
                     title={lastMessagePreview || 'Mesajlar'}
                   >
@@ -215,7 +287,13 @@ export function Header({ settings }: Props) {
               ) : null}
               {isAuthenticated ? (
                 <li className="nav-item">
-                  <NavLink to="/hesabim" className="btn btn-primary nav-cta-btn ms-lg-2" onClick={() => setNavOpen(false)}>Hesabım</NavLink>
+                  <NavLink
+                    to="/hesabim"
+                    className="btn btn-outline-warning nav-cta-btn nav-account-btn ms-lg-2"
+                    onClick={() => setNavOpen(false)}
+                  >
+                    Hesabım
+                  </NavLink>
                 </li>
               ) : (
                 <>
@@ -227,6 +305,22 @@ export function Header({ settings }: Props) {
           </div>
         </div>
       </nav>
+
+      {isAuthenticated ? (
+        <div className="mobile-quick-rail" aria-label="Hızlı Erişim">
+          <NavLink to="/bildirimler" className="mobile-quick-rail-btn" onClick={() => setNavOpen(false)} title="Bildirimler">
+            <i className="bi bi-bell-fill" />
+            {notificationUnreadTotal > 0 ? <span className="mobile-quick-rail-badge">{notificationUnreadTotal}</span> : null}
+          </NavLink>
+          <NavLink to="/mesajlar" className="mobile-quick-rail-btn" onClick={() => setNavOpen(false)} title="Mesajlar">
+            <i className="bi bi-chat-dots-fill" />
+            {messageUnreadTotal > 0 ? <span className="mobile-quick-rail-badge">{messageUnreadTotal}</span> : null}
+          </NavLink>
+          <NavLink to="/hesabim" className="mobile-quick-rail-btn" onClick={() => setNavOpen(false)} title="Hesabım">
+            <i className="bi bi-person-fill" />
+          </NavLink>
+        </div>
+      ) : null}
     </header>
   );
 }
